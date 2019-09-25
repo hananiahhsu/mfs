@@ -22,28 +22,34 @@
 #include "mfssrv_proto.h"
 #include "mfsproc_proto.h"
 
+#define ERR_EXIT(m)		\
+do {					\
+	perror(m);			\
+	exit(EXIT_FAILURE); \
+} while (0);
+
 extern bool exitproc;
 
-int dispatch_command(int sockfd);
+int dispatch_command(int sockfd, const mfssrv_command_header* libcreqhdr);
 
-int dispatch_command_query(int sockfd, const mfssrv_command_header *hdr);
-int dispatch_command_open(int sockfd, const mfssrv_command_header* hdr);
-int dispatch_command_close(int sockfd, const mfssrv_command_header* hdr);
-int dispatch_command_remove(int sockfd, const mfssrv_command_header* hdr);
-int dispatch_command_read(int sockfd, const mfssrv_command_header* hdr);
-int dispatch_command_write(int sockfd, const mfssrv_command_header* hdr);
-int dispatch_command_flush(int sockfd, const mfssrv_command_header* hdr);
-int dispatch_command_truncate(int sockfd, const mfssrv_command_header* hdr);
-int dispatch_command_stat(int sockfd, const mfssrv_command_header* hdr);
-int dispatch_command_statfd(int sockfd, const mfssrv_command_header* hdr);
-int dispatch_command_lock(int sockfd, const mfssrv_command_header* hdr);
-int dispatch_command_seek(int sockfd, const mfssrv_command_header* hdr);
-int dispatch_command_tell(int sockfd, const mfssrv_command_header* hdr);
+int dispatch_command_query(int sockfd, const mfssrv_command_header *reqhdr);
+int dispatch_command_open(int sockfd, const mfssrv_command_header *reqhdr);
+int dispatch_command_close(int sockfd, const mfssrv_command_header *reqhdr);
+int dispatch_command_remove(int sockfd, const mfssrv_command_header *reqhdr);
+int dispatch_command_read(int sockfd, const mfssrv_command_header *reqhdr);
+int dispatch_command_write(int sockfd, const mfssrv_command_header *reqhdr);
+int dispatch_command_flush(int sockfd, const mfssrv_command_header *reqhdr);
+int dispatch_command_truncate(int sockfd, const mfssrv_command_header *reqhdr);
+int dispatch_command_stat(int sockfd, const mfssrv_command_header *reqhdr);
+int dispatch_command_statfd(int sockfd, const mfssrv_command_header *reqhdr);
+int dispatch_command_lock(int sockfd, const mfssrv_command_header *reqhdr);
+int dispatch_command_seek(int sockfd, const mfssrv_command_header *reqhdr);
+int dispatch_command_tell(int sockfd, const mfssrv_command_header *reqhdr);
 
-bool do_init();
+int do_init();
 void do_uninit();
 
-bool check_validfd(int sock, const mfssrv_command_header* hdr, int fd);
+bool check_validfd(int sock, const mfssrv_command_header* reqhdr, int fd);
 mfssup_type_e gettype_bypath(const char* filepath);
 const char* getsupproc_bypath(const char* filepath);
 

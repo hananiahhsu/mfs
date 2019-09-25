@@ -55,7 +55,7 @@ extern "C" {
 
 int MFSAPI mfs_open(const char* filename, int flags);
 int MFSAPI mfs_remove(const char* filename);
-int MFSAPI mfs_removewitherase(const char* filename);
+//int MFSAPI mfs_removewitherase(const char* filename);
 int MFSAPI mfs_stat(const char* filename, struct stat *stbuf);
 
 int MFSAPI mfs_fstat(int fd, struct stat* stbuf);

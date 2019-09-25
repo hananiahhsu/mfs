@@ -17,6 +17,7 @@
 MULTIFS_PROJECT_ROOT ?= $(CURDIR)
 MULTIFS_OUT_DIR ?= /tmp/mfs
 MULTIFS_LIB_NAME ?= libmfs.a
+MULTIFS_DLL_NAME ?= libmfs.so
 MULTIFS_LIB_DIR := mfslibc
 MULTIFS_BIN_DIR := $(MULTIFS_PROJECT_ROOT)/bin
 
@@ -24,7 +25,7 @@ PROJECT_ROOT := $(MULTIFS_PROJECT_ROOT)
 OUT_DIR := $(MULTIFS_OUT_DIR)
 
 INCLUDE += -I$(PROJECT_ROOT) -I$(PROJECT_ROOT)/inc
-CXXFLAGS += -Werror -U__STRICT_ANSI__ -std=c++11 -lpthread -fPIC
+CXXFLAGS += -Werror -U__STRICT_ANSI__ -std=c++11 -lpthread -fPIC -g
 CXXFLAGS += -Wno-unused-local-typedefs -Wno-shadow -Wno-missing-field-initializers -Wno-unused-parameter
 
 ABS_SRC := $(wildcard $(PROJECT_ROOT)/$(MULTIFS_LIB_DIR)/*.cpp)
@@ -40,6 +41,7 @@ $(OUT_DIR)/%.o: $(MULTIFS_PROJECT_ROOT)/%.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -o $@
 
 TARGET := $(OUT_DIR)/$(MULTIFS_LIB_NAME)
+TARGETSO := $(MULTIFS_BIN_DIR)/$(MULTIFS_DLL_NAME)
 
 MFSSRV_DIR := mfssrv
 MFSSRV_SRC := $(wildcard $(PROJECT_ROOT)/$(MFSSRV_DIR)/*.cpp)
@@ -54,7 +56,7 @@ MFSDEMO_EXE := $(MULTIFS_BIN_DIR)/mfsdemo
 MFSDEMO_DEPOPT := -lcrypto
 
 .PHONY: all
-all: $(TARGET) $(MFSSRV) $(MFSDEMO_EXE)
+all: $(TARGET) $(TARGETSO) $(MFSSRV) $(MFSDEMO_EXE)
 
 .PHONY: mfssrv
 mfssrv:	$(MFSSRV)
@@ -64,6 +66,10 @@ mfsdemo: $(MFSDEMO_EXE)
 
 $(TARGET): $(OBJ)
 	$(AR) rcsD $@ $(OBJ)
+
+$(TARGETSO): $(OBJ)
+	mkdir -p $(MULTIFS_BIN_DIR)
+	$(CXX) -m64 -O2 -shared $(CXXFLAGS) $(OBJ) -o $(TARGETSO)
 
 $(MFSSRV):
 	mkdir -p $(MULTIFS_BIN_DIR)
@@ -77,6 +83,7 @@ $(MFSDEMO_EXE): $(TARGET)
 clean:
 	@$(RM) $(OBJ)
 	@$(RM) $(TARGET)
+	@$(RM) $(TARGETSO)
 	@$(RM) $(MFSSRV)
 	@$(RM) $(MFSDEMO_EXE)
 	@$(RM) -rf $(MULTIFS_BIN_DIR)

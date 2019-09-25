@@ -34,11 +34,11 @@
 
 inline size_t _senddata_withslice(int socksend, const void* buf, size_t size)
 {
-	ssize_t total = 0;
+	size_t total = 0;
 	const char* sendbuf = (const char*)buf;
 
 	while (total < size) {
-		ssize_t slice = ((size - total) >= SLICE_SIZE) ? SLICE_SIZE : (size - total);
+		size_t slice = ((size - total) >= SLICE_SIZE) ? SLICE_SIZE : (size - total);
 		ssize_t snd = send(socksend, sendbuf, slice, 0);
 		if (snd == -1) {
 			break;
@@ -53,11 +53,11 @@ inline size_t _senddata_withslice(int socksend, const void* buf, size_t size)
 
 inline size_t _recvdata_withslice(int sockrecv, void* buf, size_t size)
 {
-	ssize_t total = 0;
+	size_t total = 0;
 	char* recvbuf = (char*)buf;
 
 	while (total < size) {
-		ssize_t slice = ((size - total) >= SLICE_SIZE) ? SLICE_SIZE : (size - total);
+		size_t slice = ((size - total) >= SLICE_SIZE) ? SLICE_SIZE : (size - total);
 		ssize_t snd = recv(sockrecv, recvbuf, slice, 0);
 		if (snd == -1) {
 			break;

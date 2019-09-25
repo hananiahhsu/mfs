@@ -61,46 +61,11 @@ static protocol_prefix protogroup[] = {
 std::thread* threadgroup[THREAD_MAX_COUNT] = { NULL };
 
 static std::atomic_uint32_t prosequece(0);
-bool exitproc(false);
+bool exitproc = false;
+int listenfd = -1;
 
 static void thread_task();
 
-
-
-bool do_init()
-{
-	if (fdmap != NULL) {
-		delete fdmap;
-	}
-
-	fdmap = new(std::nothrow) std::map<int, mfsio_info*>;
-	if (fdmap == NULL) {
-		return false;
-	}
-
-	for (int i = 0; i < THREAD_MAX_COUNT; i++) {
-		threadgroup[i] = new(std::nothrow) std::thread(&thread_task);
-		if (threadgroup[i] == NULL) {
-			break;
-		}
-	}
-
-	return true;
-}
-
-void do_uninit()
-{
-	if (fdmap != NULL) {
-		delete fdmap;
-		fdmap = NULL;
-	}
-
-	for (int i = 0; i < THREAD_MAX_COUNT; i++) {
-		threadgroup[i]->join();
-		delete threadgroup[i];
-		threadgroup[i] = NULL;
-	}
-}
 
 void signal_handler(int sig)
 {
@@ -122,22 +87,87 @@ void signal_handler(int sig)
 				}
 			}
 		} while (true);
-	} else if (sig == SIGTERM || sig == SIGHUP) {
+	}
+	else if (sig == SIGTERM
+		|| sig == SIGINT) {
 		exitproc = true;
+		close(listenfd);
+		listenfd = -1;
 	}
 }
 
-bool check_validfd(int sock, const mfssrv_command_header* hdr, int fd)
+int do_init()
+{
+	listenfd = socket(PF_UNIX, SOCK_STREAM, 0);
+	if (listenfd == -1) {
+		ERR_EXIT("mfs socket error");
+	}
+
+	unlink(MFSSRV_SOCK_NAME);
+	sockaddr_un servaddr = {};
+	servaddr.sun_family = AF_UNIX;
+	strcpy(servaddr.sun_path, MFSSRV_SOCK_NAME);
+
+	int ret = bind(listenfd, (sockaddr*)& servaddr, sizeof(servaddr));
+	if (ret < 0) {
+		ERR_EXIT("mfs bind error");
+	}
+
+	ret = listen(listenfd, SOMAXCONN);
+	if (ret < 0) {
+		ERR_EXIT("listen error");
+	}
+
+	chmod(MFSSRV_SOCK_NAME, 00777);
+
+	if (fdmap != NULL) {
+		delete fdmap;
+		fdmap = NULL;
+	}
+
+	fdmap = new(std::nothrow) std::map<int, mfsio_info*>;
+	if (fdmap == NULL) {
+		close(listenfd);
+		listenfd = -1;
+
+		return false;
+	}
+
+	for (int i = 0; i < THREAD_MAX_COUNT; i++) {
+		threadgroup[i] = new(std::nothrow) std::thread(&thread_task);
+		if (threadgroup[i] == NULL) {
+			break;
+		}
+	}
+
+	return listenfd;
+}
+
+void do_uninit()
+{
+	if (fdmap != NULL) {
+		delete fdmap;
+		fdmap = NULL;
+	}
+
+	for (int i = 0; i < THREAD_MAX_COUNT; i++) {
+		threadgroup[i]->join();
+		delete threadgroup[i];
+		threadgroup[i] = NULL;
+	}
+}
+
+bool check_validfd(int sock, const mfssrv_command_header* reqhdr, int fd)
 {
 	bool ret = false;
 
 	if (!MFSSRV_REMOTEFD_CHECK(fd)) {
-		ssize_t ssize = msgsend_to_mfslibc(sock, hdr, NULL, 0, EINVAL);
+		ssize_t ssize = msgsend_to_mfslibc(sock, reqhdr, NULL, 0, EINVAL);
 	} else {
 		int index = MFSSRV_REMOTEFD_GETVALUE(fd);
 		auto info = fdmap->find(index);
 		if (info == fdmap->end()) {
-			ssize_t ssize = msgsend_to_mfslibc(sock, hdr, NULL, 0, EINVAL);
+			ssize_t ssize = msgsend_to_mfslibc(sock, reqhdr, NULL, 0, EINVAL);
 		} else {
 			ret = true;
 		}
@@ -149,8 +179,8 @@ bool check_validfd(int sock, const mfssrv_command_header* hdr, int fd)
 mfssup_type_e gettype_bypath(const char* filepath)
 {
 	mfssup_type_e type = MFSSUP_TYPE_SNOTSUP;
-	for (int i = 0; i < sizeof(protogroup) / sizeof(protogroup[0]); i++) {
-		int preflen = strlen(protogroup[i].prefix);
+	for (size_t i = 0; i < sizeof(protogroup) / sizeof(protogroup[0]); i++) {
+		size_t preflen = strlen(protogroup[i].prefix);
 		int cmp = strncmp(protogroup[i].prefix, filepath, preflen);
 		if (cmp == 0) {
 			if (protogroup[i].support) {
@@ -167,8 +197,8 @@ mfssup_type_e gettype_bypath(const char* filepath)
 const char* getsupproc_bypath(const char* filepath)
 {
 	const char *filename = NULL;
-	for (int i = 0; i < sizeof(protogroup) / sizeof(protogroup[0]); i++) {
-		int preflen = strlen(protogroup[i].prefix);
+	for (size_t i = 0; i < sizeof(protogroup) / sizeof(protogroup[0]); i++) {
+		size_t preflen = strlen(protogroup[i].prefix);
 		int cmp = strncmp(protogroup[i].prefix, filepath, preflen);
 		if (cmp == 0) {
 			if (protogroup[i].support) {
@@ -187,11 +217,11 @@ size_t msgsend_to_mfslibc(int sockfd, const mfssrv_command_header* reqhdr,
 {
 	mfssrv_command_header anshdr = *reqhdr;
 	anshdr.mode = MFSSRV_OP_ANSWER;
-	anshdr.payload = paloadsize;
+	anshdr.payload = (uint32_t)paloadsize;
 	anshdr.error = error;
 	anshdr.reserved = 0;
 
-	ssize_t ssize = _senddata_withslice(sockfd, &anshdr, sizeof(anshdr));
+	size_t ssize = _senddata_withslice(sockfd, &anshdr, sizeof(anshdr));
 	if (ssize != sizeof(anshdr)) {
 		return -1;
 	}
@@ -204,81 +234,76 @@ size_t msgsend_to_mfslibc(int sockfd, const mfssrv_command_header* reqhdr,
 	return ssize;
 }
 
-int dispatch_command(int sockfd)
+int dispatch_command(int sockfd, const mfssrv_command_header* libcreqhdr)
 {
-	mfssrv_command_header srvhdr = {};
-	ssize_t rsize = _recvdata_withslice(sockfd, &srvhdr, sizeof(srvhdr));
-	if (rsize != sizeof(srvhdr)) {
-		return -1;
-	}
-
 	int result = -1;
 
 	do 
 	{
-		if (srvhdr.magic != MFSSRV_HEADER_MAGIC) {
+		if (libcreqhdr->magic != MFSSRV_HEADER_MAGIC) {
 			errno = EPROTO;
 			break;
 		}
 
-		if (srvhdr.version != MFSSRV_PROTO_VERSION) {
+		if (libcreqhdr->version != MFSSRV_PROTO_VERSION) {
 			errno = EPROTONOSUPPORT;
 			break;
 		}
 
-		if (srvhdr.mode != MFSSRV_OP_REQUEST) {
+		if (libcreqhdr->mode != MFSSRV_OP_REQUEST) {
 			errno = EPROTO;
 			break;
 		}
 
-		if (srvhdr.command >= MFSSRV_COMMAND_MAX) {
+		if (libcreqhdr->command >= MFSSRV_COMMAND_MAX) {
 			errno = EPROTO;
 			break;
 		}
 
-		if (srvhdr.error != 0)	{
+		if (libcreqhdr->error != 0)	{
 			errno = EPROTO;
 			break;
 		}
 
-		typedef int (*dispatch_routine)(int sockfd, const mfssrv_command_header * srvhdr);
+		typedef int (*dispatch_routine)(int sockfd, const mfssrv_command_header * libcreqhdr);
 		typedef struct _dispatch_table {
-			int command;
+			uint32_t command;
 			dispatch_routine routine;
 			size_t min_payload;
+			bool asyncmode;
 		}dispatch_table;
 		static dispatch_table disptbl[] = {
-			{MFSSRV_COMMAND_QUERY, &dispatch_command_query, sizeof(mfssrv_command_query_in)},
-			{MFSSRV_COMMAND_LOCK, &dispatch_command_lock, sizeof(mfssrv_command_lock_in)},
-			{MFSSRV_COMMAND_SEEK, &dispatch_command_seek, sizeof(mfssrv_command_seek_in)},
-			{MFSSRV_COMMAND_TELL, &dispatch_command_tell, sizeof(mfssrv_command_tell_in)},
-			{MFSSRV_COMMAND_CLOSE, &dispatch_command_close, sizeof(mfssrv_command_close_in)},
+			{MFSSRV_COMMAND_QUERY, &dispatch_command_query, sizeof(mfssrv_command_query_in), false},
+			{MFSSRV_COMMAND_LOCK, &dispatch_command_lock, sizeof(mfssrv_command_lock_in), false},
+			{MFSSRV_COMMAND_SEEK, &dispatch_command_seek, sizeof(mfssrv_command_seek_in), false},
+			{MFSSRV_COMMAND_TELL, &dispatch_command_tell, sizeof(mfssrv_command_tell_in), false},
+			{MFSSRV_COMMAND_CLOSE, &dispatch_command_close, sizeof(mfssrv_command_close_in), false},
 
-			{MFSSRV_COMMAND_OPEN, &dispatch_command_open, sizeof(mfssrv_command_open_in)},
-			{MFSSRV_COMMAND_REMOVE, &dispatch_command_remove, sizeof(mfssrv_command_remove_in)},
-			{MFSSRV_COMMAND_READ, &dispatch_command_read, sizeof(mfssrv_command_read_in)},
-			{MFSSRV_COMMAND_WRITE, &dispatch_command_write, sizeof(mfssrv_command_write_in)},
-			{MFSSRV_COMMAND_FLUSH, &dispatch_command_flush, sizeof(mfssrv_command_flush_in)},
-			{MFSSRV_COMMAND_TRUNCATE, &dispatch_command_truncate, sizeof(mfssrv_command_truncate_in)},
-			{MFSSRV_COMMAND_STAT, &dispatch_command_stat, sizeof(mfssrv_command_stat_in)},
-			{MFSSRV_COMMAND_STATFD, &dispatch_command_statfd, sizeof(mfssrv_command_statfd_in)},
+			{MFSSRV_COMMAND_OPEN, &dispatch_command_open, sizeof(mfssrv_command_open_in), true},
+			{MFSSRV_COMMAND_REMOVE, &dispatch_command_remove, sizeof(mfssrv_command_remove_in), true},
+			{MFSSRV_COMMAND_READ, &dispatch_command_read, sizeof(mfssrv_command_read_in), true},
+			{MFSSRV_COMMAND_WRITE, &dispatch_command_write, sizeof(mfssrv_command_write_in), true},
+			{MFSSRV_COMMAND_FLUSH, &dispatch_command_flush, sizeof(mfssrv_command_flush_in), true},
+			{MFSSRV_COMMAND_TRUNCATE, &dispatch_command_truncate, sizeof(mfssrv_command_truncate_in), true},
+			{MFSSRV_COMMAND_STAT, &dispatch_command_stat, sizeof(mfssrv_command_stat_in), true},
+			{MFSSRV_COMMAND_STATFD, &dispatch_command_statfd, sizeof(mfssrv_command_statfd_in), true},
 		};
 
-		for (int i=0; i<sizeof(disptbl)/sizeof(disptbl[0]); i++) {
-			if (srvhdr.command == disptbl[i].command) {
-				if (srvhdr.payload < disptbl[i].min_payload) {
+		for (size_t i = 0; i < sizeof(disptbl) / sizeof(disptbl[0]); i++) {
+			if (libcreqhdr->command == disptbl[i].command) {
+				if (libcreqhdr->payload < disptbl[i].min_payload) {
 					errno = EPROTO;
 					break;
 				}
 
-				result = disptbl[i].routine(sockfd, &srvhdr);
+				result = disptbl[i].routine(sockfd, libcreqhdr);
 				break;
 			}
 		}
 	} while (false);
 
 	if (result == -1) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, &srvhdr, NULL, 0, errno);
+		ssize_t ssize = msgsend_to_mfslibc(sockfd, libcreqhdr, NULL, 0, errno);
 	}
 
 	close(sockfd);
@@ -286,30 +311,30 @@ int dispatch_command(int sockfd)
 	return result;
 }
 
-int dispatch_command_query(int sockfd, const mfssrv_command_header* hdr)
+int dispatch_command_query(int sockfd, const mfssrv_command_header* reqhdr)
 {
-	mfssrv_command_query_in queryin = {};
-	ssize_t rsize = _recvdata_withslice(sockfd, &queryin, sizeof(queryin));
-	if (rsize != sizeof(queryin)) {
+	mfssrv_command_query_in srvqueryin = {};
+	size_t rsize = _recvdata_withslice(sockfd, &srvqueryin, sizeof(srvqueryin));
+	if (rsize != sizeof(srvqueryin)) {
 		errno = EPROTO;
 		return -1;
 	}
 
-	mfssrv_command_query_out queryout = {};
-	queryout.type = gettype_bypath(queryin.filepath);
+	mfssrv_command_query_out srvqueryout = {};
+	srvqueryout.type = gettype_bypath(srvqueryin.filepath);
 
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, &queryout, sizeof(queryout), 0);
-	if (ssize != sizeof(queryout)) {
+	size_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, &srvqueryout, sizeof(srvqueryout), 0);
+	if (ssize != sizeof(srvqueryout)) {
 		return -1;
 	}
 
 	return 0;
 }
 
-int dispatch_command_open(int sockfd, const mfssrv_command_header* hdr)
+int dispatch_command_open(int sockfd, const mfssrv_command_header* reqhdr)
 {
 	mfssrv_command_open_in srvopenin = {};
-	ssize_t rsize = _recvdata_withslice(sockfd, &srvopenin, sizeof(srvopenin));
+	size_t rsize = _recvdata_withslice(sockfd, &srvopenin, sizeof(srvopenin));
 	if (rsize != sizeof(srvopenin)) {
 		errno = EPROTO;
 		return -1;
@@ -328,7 +353,7 @@ int dispatch_command_open(int sockfd, const mfssrv_command_header* hdr)
 			break;
 		}
 
-		int len = strlen(srvopenin.filepath);
+		size_t len = strlen(srvopenin.filepath);
 		if (len >= PATH_MAX) {
 			error = EINVAL;
 			break;
@@ -445,38 +470,38 @@ int dispatch_command_open(int sockfd, const mfssrv_command_header* hdr)
 	} while (false);
 
 	if (result == -1) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, error);
+		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, error);
 	} else {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, &srvopenout, sizeof(srvopenout), 0);
+		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, &srvopenout, sizeof(srvopenout), 0);
 	}
 	
 	return result;
 }
 
-int dispatch_command_close(int sockfd, const mfssrv_command_header* hdr)
+int dispatch_command_close(int sockfd, const mfssrv_command_header* reqhdr)
 {
 	mfssrv_command_close_in srvclosein = {};
-	ssize_t rsize = _recvdata_withslice(sockfd, &srvclosein, sizeof(srvclosein));
+	size_t rsize = _recvdata_withslice(sockfd, &srvclosein, sizeof(srvclosein));
 	if (rsize != sizeof(srvclosein)) {
 		errno = EPROTO;
 		return -1;
 	}
 
-	bool validfd = check_validfd(sockfd, hdr, srvclosein.fd);
+	bool validfd = check_validfd(sockfd, reqhdr, srvclosein.fd);
 	if (!validfd) {
 		return -1;
 	}
 
 	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(srvclosein.fd));
 	if (it == fdmap->end()) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, EINVAL);
+		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
 		return -1;
 	}
 
 	close(it->second->sockfd);
 	kill(it->first, SIGKILL);
 
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, 0);
+	ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, 0);
 	if (ssize == -1) {
 		return -1;
 	}
@@ -484,10 +509,10 @@ int dispatch_command_close(int sockfd, const mfssrv_command_header* hdr)
 	return 0;
 }
 
-int dispatch_command_remove(int sockfd, const mfssrv_command_header* hdr)
+int dispatch_command_remove(int sockfd, const mfssrv_command_header* reqhdr)
 {
 	mfssrv_command_remove_in srvremovein = {};
-	ssize_t rsize = _recvdata_withslice(sockfd, &srvremovein, sizeof(srvremovein));
+	size_t rsize = _recvdata_withslice(sockfd, &srvremovein, sizeof(srvremovein));
 	if (rsize != sizeof(srvremovein)) {
 		errno = EPROTO;
 		return -1;
@@ -498,9 +523,9 @@ int dispatch_command_remove(int sockfd, const mfssrv_command_header* hdr)
 
 	do 
 	{
-		int len = strlen(srvremovein.filepath);
+		size_t len = strlen(srvremovein.filepath);
 		if (len >= PATH_MAX) {
-			ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, EINVAL);
+			ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
 			break;
 		}
 
@@ -545,7 +570,7 @@ int dispatch_command_remove(int sockfd, const mfssrv_command_header* hdr)
 		result = 0;
 	} while (false);
 
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, err);
+	ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, err);
 	if (ssize == -1) {
 		return -1;
 	}
@@ -553,23 +578,23 @@ int dispatch_command_remove(int sockfd, const mfssrv_command_header* hdr)
 	return 0;
 }
 
-int dispatch_command_read(int sockfd, const mfssrv_command_header* hdr)
+int dispatch_command_read(int sockfd, const mfssrv_command_header* reqhdr)
 {
 	mfssrv_command_read_in srvreadin = {};
-	ssize_t rsize = _recvdata_withslice(sockfd, &srvreadin, sizeof(srvreadin));
+	size_t rsize = _recvdata_withslice(sockfd, &srvreadin, sizeof(srvreadin));
 	if (rsize != sizeof(srvreadin)) {
 		errno = EPROTO;
 		return -1;
 	}
 
-	bool validfd = check_validfd(sockfd, hdr, srvreadin.fd);
+	bool validfd = check_validfd(sockfd, reqhdr, srvreadin.fd);
 	if (!validfd) {
 		return -1;
 	}
 
 	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(srvreadin.fd));
 	if (it == fdmap->end()) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, EINVAL);
+		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
 		return -1;
 	}
 
@@ -619,7 +644,7 @@ int dispatch_command_read(int sockfd, const mfssrv_command_header* hdr)
 		err = 0;
 	} while (false);
 
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, err);
+	ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, err);
 	if (ssize == -1) {
 		return -1;
 	}
@@ -627,23 +652,23 @@ int dispatch_command_read(int sockfd, const mfssrv_command_header* hdr)
 	return 0;
 }
 
-int dispatch_command_write(int sockfd, const mfssrv_command_header* hdr)
+int dispatch_command_write(int sockfd, const mfssrv_command_header* reqhdr)
 {
 	mfssrv_command_write_in srvwritein = {};
-	ssize_t rsize = _recvdata_withslice(sockfd, &srvwritein, sizeof(srvwritein));
+	size_t rsize = _recvdata_withslice(sockfd, &srvwritein, sizeof(srvwritein));
 	if (rsize != sizeof(srvwritein)) {
 		errno = EPROTO;
 		return -1;
 	}
 
-	bool validfd = check_validfd(sockfd, hdr, srvwritein.fd);
+	bool validfd = check_validfd(sockfd, reqhdr, srvwritein.fd);
 	if (!validfd) {
 		return -1;
 	}
 
 	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(srvwritein.fd));
 	if (it == fdmap->end()) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, EINVAL);
+		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
 		return -1;
 	}
 
@@ -676,7 +701,7 @@ int dispatch_command_write(int sockfd, const mfssrv_command_header* hdr)
 		err = 0;
 	} while (false);
 
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, err);
+	ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, err);
 	if (ssize == -1) {
 		return -1;
 	}
@@ -684,23 +709,23 @@ int dispatch_command_write(int sockfd, const mfssrv_command_header* hdr)
 	return 0;
 }
 
-int dispatch_command_flush(int sockfd, const mfssrv_command_header* hdr)
+int dispatch_command_flush(int sockfd, const mfssrv_command_header* reqhdr)
 {
 	mfssrv_command_flush_in flushin = {};
-	ssize_t rsize = _recvdata_withslice(sockfd, &flushin, sizeof(flushin));
+	size_t rsize = _recvdata_withslice(sockfd, &flushin, sizeof(flushin));
 	if (rsize != sizeof(flushin)) {
 		errno = EPROTO;
 		return -1;
 	}
 
-	bool validfd = check_validfd(sockfd, hdr, flushin.fd);
+	bool validfd = check_validfd(sockfd, reqhdr, flushin.fd);
 	if (!validfd) {
 		return -1;
 	}
 
 	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(flushin.fd));
 	if (it == fdmap->end()) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, EINVAL);
+		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
 		return -1;
 	}
 
@@ -732,7 +757,7 @@ int dispatch_command_flush(int sockfd, const mfssrv_command_header* hdr)
 		err = 0;
 	} while (false);
 	
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, err);
+	ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, err);
 	if (ssize == -1) {
 		return -1;
 	}
@@ -740,23 +765,23 @@ int dispatch_command_flush(int sockfd, const mfssrv_command_header* hdr)
 	return 0;
 }
 
-int dispatch_command_truncate(int sockfd, const mfssrv_command_header* hdr)
+int dispatch_command_truncate(int sockfd, const mfssrv_command_header* reqhdr)
 {
 	mfssrv_command_truncate_in truncatein = {};
-	ssize_t rsize = _recvdata_withslice(sockfd, &truncatein, sizeof(truncatein));
+	size_t rsize = _recvdata_withslice(sockfd, &truncatein, sizeof(truncatein));
 	if (rsize != sizeof(truncatein)) {
 		errno = EPROTO;
 		return -1;
 	}
 
-	bool validfd = check_validfd(sockfd, hdr, truncatein.fd);
+	bool validfd = check_validfd(sockfd, reqhdr, truncatein.fd);
 	if (!validfd) {
 		return -1;
 	}
 
 	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(truncatein.fd));
 	if (it == fdmap->end()) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, EINVAL);
+		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
 		return -1;
 	}
 
@@ -788,7 +813,7 @@ int dispatch_command_truncate(int sockfd, const mfssrv_command_header* hdr)
 		err = 0;
 	} while (false);
 
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, err);
+	ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, err);
 	if (ssize == -1) {
 		return -1;
 	}
@@ -796,18 +821,18 @@ int dispatch_command_truncate(int sockfd, const mfssrv_command_header* hdr)
 	return 0;
 }
 
-int dispatch_command_stat(int sockfd, const mfssrv_command_header* hdr)
+int dispatch_command_stat(int sockfd, const mfssrv_command_header* reqhdr)
 {
 	mfssrv_command_stat_in srvstatin = {};
-	ssize_t rsize = _recvdata_withslice(sockfd, &srvstatin, sizeof(srvstatin));
+	size_t rsize = _recvdata_withslice(sockfd, &srvstatin, sizeof(srvstatin));
 	if (rsize != sizeof(srvstatin)) {
 		errno = EPROTO;
 		return -1;
 	}
 
-	int len = strlen(srvstatin.filepath);
+	size_t len = strlen(srvstatin.filepath);
 	if (len >= PATH_MAX) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, EINVAL);
+		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
 		return -1;
 	}
 
@@ -859,12 +884,10 @@ int dispatch_command_stat(int sockfd, const mfssrv_command_header* hdr)
 	} while (false);
 
 	ssize_t ssize = 0;
-	if (err == 0)
-	{
-		ssize = msgsend_to_mfslibc(sockfd, hdr, &procstatout, sizeof(procstatout), 0);
-	}
-	else {
-		ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, err);
+	if (err == 0) {
+		ssize = msgsend_to_mfslibc(sockfd, reqhdr, &procstatout, sizeof(procstatout), 0);
+	} else {
+		ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, err);
 	}
 	if (ssize == -1) {
 		return -1;
@@ -873,23 +896,23 @@ int dispatch_command_stat(int sockfd, const mfssrv_command_header* hdr)
 	return 0;
 }
 
-int dispatch_command_statfd(int sockfd, const mfssrv_command_header* hdr)
+int dispatch_command_statfd(int sockfd, const mfssrv_command_header* reqhdr)
 {
 	mfssrv_command_statfd_in statin = {};
-	ssize_t rsize = _recvdata_withslice(sockfd, &statin, sizeof(statin));
+	size_t rsize = _recvdata_withslice(sockfd, &statin, sizeof(statin));
 	if (rsize != sizeof(statin)) {
 		errno = EPROTO;
 		return -1;
 	}
 
-	bool validfd = check_validfd(sockfd, hdr, statin.fd);
+	bool validfd = check_validfd(sockfd, reqhdr, statin.fd);
 	if (!validfd) {
 		return -1;
 	}
 
 	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(statin.fd));
 	if (it == fdmap->end()) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, EINVAL);
+		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
 		return -1;
 	}
 
@@ -939,9 +962,9 @@ int dispatch_command_statfd(int sockfd, const mfssrv_command_header* hdr)
 	ssize_t ssize = 0;
 	if (err == 0)
 	{
-		ssize = msgsend_to_mfslibc(sockfd, hdr, &procstatout, sizeof(procstatout), 0);
+		ssize = msgsend_to_mfslibc(sockfd, reqhdr, &procstatout, sizeof(procstatout), 0);
 	} else {
-		ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, err);
+		ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, err);
 	}
 	if (ssize == -1) {
 		return -1;
@@ -950,28 +973,28 @@ int dispatch_command_statfd(int sockfd, const mfssrv_command_header* hdr)
 	return 0;
 }
 
-int dispatch_command_lock(int sockfd, const mfssrv_command_header* hdr)
+int dispatch_command_lock(int sockfd, const mfssrv_command_header* reqhdr)
 {
 	mfssrv_command_lock_in srvlockin = {};
-	ssize_t rsize = _recvdata_withslice(sockfd, &srvlockin, sizeof(srvlockin));
+	size_t rsize = _recvdata_withslice(sockfd, &srvlockin, sizeof(srvlockin));
 	if (rsize != sizeof(srvlockin)) {
 		errno = EPROTO;
 		return -1;
 	}
 
-	bool validfd = check_validfd(sockfd, hdr, srvlockin.fd);
+	bool validfd = check_validfd(sockfd, reqhdr, srvlockin.fd);
 	if (!validfd) {
 		return -1;
 	}
 
 	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(srvlockin.fd));
 	if (it == fdmap->end()) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, EINVAL);
+		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
 		return -1;
 	}
 
 	//========= todo =========
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, 0);
+	ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, 0);
 	if (ssize == -1) {
 		return -1;
 	}
@@ -979,23 +1002,23 @@ int dispatch_command_lock(int sockfd, const mfssrv_command_header* hdr)
 	return 0;
 }
 
-int dispatch_command_seek(int sockfd, const mfssrv_command_header* hdr)
+int dispatch_command_seek(int sockfd, const mfssrv_command_header* reqhdr)
 {
 	mfssrv_command_seek_in srvseekin = {};
-	ssize_t rsize = _recvdata_withslice(sockfd, &srvseekin, sizeof(srvseekin));
+	size_t rsize = _recvdata_withslice(sockfd, &srvseekin, sizeof(srvseekin));
 	if (rsize != sizeof(srvseekin)) {
 		errno = EPROTO;
 		return -1;
 	}
 
-	bool validfd = check_validfd(sockfd, hdr, srvseekin.fd);
+	bool validfd = check_validfd(sockfd, reqhdr, srvseekin.fd);
 	if (!validfd) {
 		return -1;
 	}
 
 	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(srvseekin.fd));
 	if (it == fdmap->end()) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, EINVAL);
+		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
 		return -1;
 	}
 
@@ -1015,7 +1038,7 @@ int dispatch_command_seek(int sockfd, const mfssrv_command_header* hdr)
 	}
 	it->second->offset = newoff;
 	
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, 0);
+	ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, 0);
 	if (ssize == -1) {
 		return -1;
 	}
@@ -1023,30 +1046,29 @@ int dispatch_command_seek(int sockfd, const mfssrv_command_header* hdr)
 	return 0;
 }
 
-int dispatch_command_tell(int sockfd, const mfssrv_command_header* hdr)
+int dispatch_command_tell(int sockfd, const mfssrv_command_header* reqhdr)
 {
 	mfssrv_command_tell_in srvtellin = {};
-	ssize_t rsize = _recvdata_withslice(sockfd, &srvtellin, sizeof(srvtellin));
+	size_t rsize = _recvdata_withslice(sockfd, &srvtellin, sizeof(srvtellin));
 	if (rsize != sizeof(srvtellin)) {
 		errno = EPROTO;
 		return -1;
 	}
 
-	bool validfd = check_validfd(sockfd, hdr, srvtellin.fd);
+	bool validfd = check_validfd(sockfd, reqhdr, srvtellin.fd);
 	if (!validfd) {
 		return -1;
 	}
 
 	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(srvtellin.fd));
 	if (it == fdmap->end()) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, NULL, 0, EINVAL);
+		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
 		return -1;
 	}
 
 	mfssrv_command_tell_out srvtellout = {};
 	srvtellout.offset = it->second->offset;
-
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, hdr, &srvtellout, sizeof(srvtellout), 0);
+	ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, &srvtellout, sizeof(srvtellout), 0);
 	if (ssize == -1) {
 		return -1;
 	}
