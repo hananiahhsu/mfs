@@ -40,7 +40,7 @@ int MFSAPI mfs_feof(MFS_FILE* stream)
 
 	int ret = _mfslibc_ipccommand(MFSSRV_COMMAND_STATFD,
 		&statfdin, sizeof(statfdin), &statout, sizeof(statout), &rtrecv);
-	if (ret == -1 || rtrecv != sizeof(statout)) {
+	if (rtrecv != sizeof(statout)) {
 		return 0;
 	}
 

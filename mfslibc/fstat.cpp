@@ -40,7 +40,7 @@ int MFSAPI mfs_fstat(int fd, struct stat *stbuf)
 
 	int ret = _mfslibc_ipccommand(MFSSRV_COMMAND_STAT,
 		&statfdin, sizeof(statfdin), &statout, sizeof(statout), &rtrecv);
-	if (ret == -1 || rtrecv != sizeof(statout)) {
+	if (rtrecv != sizeof(statout)) {
 		return -1;
 	}
 
@@ -64,10 +64,15 @@ int MFSAPI mfs_stat(const char* filename, struct stat* stbuf)
 	}
 
 	int sup = _mfslibc_querysupport(filename);
-	if (sup != MFSSUP_TYPE_SMFS) {
+	if (sup == MFSSUP_TYPE_NOTMFSTYPE) {
 		// for local mode
 		int ret = stat(filename, stbuf);
 		return ret;
+	}
+
+	if (sup != MFSSUP_TYPE_SUPMFSTYPE) {
+		errno = EOPNOTSUPP;
+		return -1;
 	}
 
 	mfssrv_command_stat_in statin = {};
@@ -79,7 +84,7 @@ int MFSAPI mfs_stat(const char* filename, struct stat* stbuf)
 
 	int ret = _mfslibc_ipccommand(MFSSRV_COMMAND_STAT,
 		&statin, sizeof(statin), &statout, sizeof(statout), &rtrecv);
-	if (ret == -1 || rtrecv != sizeof(statout)) {
+	if (rtrecv != sizeof(statout)) {
 		return -1;
 	}
 

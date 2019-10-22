@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
+#include <string>
 
 
 MFS_FILE* MFSAPI mfs_fopen(const char* filename, const char* mode)
@@ -32,7 +33,7 @@ MFS_FILE* MFSAPI mfs_fopen(const char* filename, const char* mode)
 		return NULL;
 	}
 
-	MFS_FILE *result = (MFS_FILE *)malloc(sizeof(MFS_FILE));
+	MFS_FILE *result = new(std::nothrow) MFS_FILE;
 	if (result == NULL) {
 		errno = ENOMEM;
 		return NULL;
@@ -47,22 +48,26 @@ MFS_FILE* MFSAPI mfs_fopen(const char* filename, const char* mode)
 	result->_openmode = _mfslibc_getopmode(mode);
 
 	int sup = _mfslibc_querysupport(filename);
-	if (sup != MFSSUP_TYPE_SMFS) {
+	if (sup == MFSSUP_TYPE_NOTMFSTYPE) {
 		// for local mode
 		result->_local = 1;
 		result->_file = fopen(filename, mode);
 		if (result->_file == NULL) {
 			free(result);
 			result = NULL;
-		} else {
+		}
+		else {
 			result->_fd = fileno(result->_file);
 		}
-	} else {
+	} else if (sup == MFSSUP_TYPE_SUPMFSTYPE) {
 		result->_fd = mfs_open(filename, result->_openmode);
 		if (result->_fd == -1) {
 			free(result);
 			result = NULL;
 		}
+	} else {
+		delete result;
+		result = NULL;
 	}
 
 	return result;

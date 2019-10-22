@@ -24,14 +24,14 @@ int main(int argc, char *argv[])
 	do {
 		int fd = mfs_open(testfile, O_RDWR | O_CREAT);
 		if (fd == -1) {
-			printf("mfs_open failure, error=%d\n", errno);
+			printf("mfs_open failure, error=%d-[%s]\n", errno, strerror(errno));
 			return -1;
 		}
 		printf("mfs_open fd=%d\n", fd);
 
 		file = mfs_fdopen(fd, "rw+");
 		if (file == NULL) {
-			printf("mfs_fdopen failure, error=%d\n", errno);
+			printf("mfs_fdopen failure, error=%d-[%s]\n", errno, strerror(errno));
 			mfs_close(fd);
 			return -1;
 		}
@@ -41,14 +41,14 @@ int main(int argc, char *argv[])
 		memset(buf1, 0x11, sizeof(buf1));
 		size_t size = mfs_fwrite(buf1, 1, sizeof(buf1), file);
 		if (size == -1) {
-			printf("mfs_fwrite failure, error=%d\n", errno);
+			printf("mfs_fwrite failure, error=%d-[%s]\n", errno, strerror(errno));
 			break;
 		}
 		totalsize += size;
 
 		int ret = mfs_fflush(file);
 		if (ret == -1) {
-			printf("mfs_fflush failure, error=%d\n", errno);
+			printf("mfs_fflush failure, error=%d-[%s]\n", errno, strerror(errno));
 			break;
 		}
 
@@ -67,7 +67,7 @@ int main(int argc, char *argv[])
 		memset(buf3, 0xCC, sizeof(buf3));
 		size = mfs_fwrite(buf3, 1, sizeof(buf3), file);
 		if (size == -1) {
-			printf("mfs_fwrite failure, error=%d\n", errno);
+			printf("mfs_fwrite failure, error=%d-[%s]\n", errno, strerror(errno));
 			break;
 		}
 		totalsize += size;
@@ -81,14 +81,14 @@ int main(int argc, char *argv[])
 		struct stat st = {};
 		int ret = mfs_stat(testfile, &st);
 		if (ret == -1) {
-			printf("mfs_stat failure, error=%d\n", errno);
+			printf("mfs_stat failure, error=%d-[%s]\n", errno, strerror(errno));
 		}
 
 		printf("writed size = %ld\nfile size = %ld\n",
 			st.st_size, totalsize);
 	}
 
-	printf("demo exit.\n");
+	printf("demo exit\n");
 	printf("======================================================\n");
 
     return 0;

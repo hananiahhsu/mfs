@@ -35,11 +35,18 @@ int MFSAPI mfs_open(const char* filename, int flags)
 	}
 
 	int sup = _mfslibc_querysupport(filename);
-	if (sup != MFSSUP_TYPE_SMFS) {
+	if (sup == MFSSUP_TYPE_NOTMFSTYPE) {
 		// for local mode
 		int fd = open(filename, flags, 0777);
 		return fd;
 	}
+
+	if (sup != MFSSUP_TYPE_SUPMFSTYPE) {
+		errno = EOPNOTSUPP;
+		return -1;
+	}
+
+	size_t rtrecv = 0;
 
 	mfssrv_command_open_in openin = {};
 	openin.mode = flags;
@@ -47,11 +54,9 @@ int MFSAPI mfs_open(const char* filename, int flags)
 
 	mfssrv_command_open_out openout = {};
 
-	size_t rtrecv = 0;
-
 	int ret = _mfslibc_ipccommand(MFSSRV_COMMAND_OPEN,
 		&openin, sizeof(openin), &openout, sizeof(openout), &rtrecv);
-	if (ret == -1 || rtrecv != sizeof(openout)) {
+	if (rtrecv != sizeof(openout)) {
 		return -1;
 	}
 

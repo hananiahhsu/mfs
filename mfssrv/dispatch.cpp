@@ -22,8 +22,10 @@
 #include <stdbool.h>
 #include <string.h>
 #include <signal.h>
+#include <fcntl.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/file.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/prctl.h>
@@ -38,6 +40,7 @@ typedef struct _mfsio_info {
 	int sockfd;
 	int openmode;
 	int error;
+	int lockstat;
 	off_t offset;
 	size_t size;
 	char filepath[PATH_MAX];
@@ -63,6 +66,7 @@ std::thread* threadgroup[THREAD_MAX_COUNT] = { NULL };
 static std::atomic_uint32_t prosequece(0);
 bool exitproc = false;
 int listenfd = -1;
+int lockfile = -1;
 
 static void thread_task();
 
@@ -87,8 +91,7 @@ void signal_handler(int sig)
 				}
 			}
 		} while (true);
-	}
-	else if (sig == SIGTERM
+	} else if (sig == SIGTERM
 		|| sig == SIGINT) {
 		exitproc = true;
 		close(listenfd);
@@ -98,9 +101,21 @@ void signal_handler(int sig)
 
 int do_init()
 {
+	lockfile = open("/tmp/mfssrv_singleproc.lock", O_CREAT | O_RDWR, 00666);
+	if (lockfile == -1) {
+		ERR_EXIT("the mfssrv lock file open failure!\n");
+	}
+	
+	int ret = flock(lockfile, LOCK_EX | LOCK_NB);
+	if (ret == -1) {
+		if (EWOULDBLOCK == errno) {
+			ERR_EXIT("the mfssrv already running!\n");
+		}
+	}
+
 	listenfd = socket(PF_UNIX, SOCK_STREAM, 0);
 	if (listenfd == -1) {
-		ERR_EXIT("mfs socket error");
+		ERR_EXIT("mfs listen socket create error\n");
 	}
 
 	unlink(MFSSRV_SOCK_NAME);
@@ -108,17 +123,20 @@ int do_init()
 	servaddr.sun_family = AF_UNIX;
 	strcpy(servaddr.sun_path, MFSSRV_SOCK_NAME);
 
-	int ret = bind(listenfd, (sockaddr*)& servaddr, sizeof(servaddr));
+	ret = bind(listenfd, (sockaddr*)&servaddr, sizeof(servaddr));
 	if (ret < 0) {
-		ERR_EXIT("mfs bind error");
+		ERR_EXIT("mfssrv bind error\n");
 	}
 
 	ret = listen(listenfd, SOMAXCONN);
 	if (ret < 0) {
-		ERR_EXIT("listen error");
+		close(listenfd);
+		listenfd = -1;
+
+		ERR_EXIT("mfssrv listen error\n");
 	}
 
-	chmod(MFSSRV_SOCK_NAME, 00777);
+	chmod(MFSSRV_SOCK_NAME, 00666);
 
 	if (fdmap != NULL) {
 		delete fdmap;
@@ -130,7 +148,7 @@ int do_init()
 		close(listenfd);
 		listenfd = -1;
 
-		return false;
+		return listenfd;
 	}
 
 	for (int i = 0; i < THREAD_MAX_COUNT; i++) {
@@ -145,6 +163,8 @@ int do_init()
 
 void do_uninit()
 {
+	unlink(MFSSRV_SOCK_NAME);
+
 	if (fdmap != NULL) {
 		delete fdmap;
 		fdmap = NULL;
@@ -155,69 +175,123 @@ void do_uninit()
 		delete threadgroup[i];
 		threadgroup[i] = NULL;
 	}
+
+	if (lockfile != -1) {
+		flock(lockfile, LOCK_UN);
+		close(lockfile);
+		lockfile = -1;
+	}
 }
 
 bool check_validfd(int sock, const mfssrv_command_header* reqhdr, int fd)
 {
 	bool ret = false;
 
-	if (!MFSSRV_REMOTEFD_CHECK(fd)) {
-		ssize_t ssize = msgsend_to_mfslibc(sock, reqhdr, NULL, 0, EINVAL);
-	} else {
+	do {
+		if (!MFSSRV_REMOTEFD_CHECK(fd)) {
+			break;
+		}
+		
 		int index = MFSSRV_REMOTEFD_GETVALUE(fd);
 		auto info = fdmap->find(index);
 		if (info == fdmap->end()) {
-			ssize_t ssize = msgsend_to_mfslibc(sock, reqhdr, NULL, 0, EINVAL);
-		} else {
-			ret = true;
+			break;
 		}
-	}
-
+		
+		ret = true;
+	} while (false);
+	
 	return ret;
 }
 
-mfssup_type_e gettype_bypath(const char* filepath)
+mfssup_type_e gettype_bypath(const char* opfilepath)
 {
-	mfssup_type_e type = MFSSUP_TYPE_SNOTSUP;
+	mfssup_type_e type = MFSSUP_TYPE_NOTSUPMFSTYPE;
 	for (size_t i = 0; i < sizeof(protogroup) / sizeof(protogroup[0]); i++) {
 		size_t preflen = strlen(protogroup[i].prefix);
-		int cmp = strncmp(protogroup[i].prefix, filepath, preflen);
-		if (cmp == 0) {
-			if (protogroup[i].support) {
-				type = MFSSUP_TYPE_SMFS;
-			}
+		int cmp = strncmp(protogroup[i].prefix, opfilepath, preflen);
+		if (cmp != 0) {
+			continue;
+		}
 
+		if (!protogroup[i].support) {
 			break;
 		}
+
+		char fullpath_subproc[PATH_MAX] = {};
+		int cnt = readlink("/proc/self/exe", fullpath_subproc, PATH_MAX);
+		if (cnt < 0 || cnt >= PATH_MAX) {
+			printf("get self directory failure, err = %d\n", errno);
+			break;
+		}
+
+		for (int i = cnt; i >= 0; i--) {
+			if (fullpath_subproc[i] == '/') {
+				fullpath_subproc[i + 1] = '\0';
+				break;
+			}
+		}
+
+		strcat(fullpath_subproc, protogroup[i].supportfile);
+		int ret = access(fullpath_subproc, X_OK);
+		if (ret != -1) {
+			type = MFSSUP_TYPE_SUPMFSTYPE;
+		}
+
+		break;
 	}
 
 	return type;
 }
 
-const char* getsupproc_bypath(const char* filepath)
+char* get_supprocpath_byopfilepath(const char* opfilepath)
 {
-	const char *filename = NULL;
+	char* supproc = NULL;
+
 	for (size_t i = 0; i < sizeof(protogroup) / sizeof(protogroup[0]); i++) {
 		size_t preflen = strlen(protogroup[i].prefix);
-		int cmp = strncmp(protogroup[i].prefix, filepath, preflen);
-		if (cmp == 0) {
-			if (protogroup[i].support) {
-				filename = protogroup[i].supportfile;
-			}
+		int cmp = strncmp(protogroup[i].prefix, opfilepath, preflen);
+		if (cmp != 0) {
+			continue;
+		}
 
+		if (!protogroup[i].support) {
 			break;
 		}
+
+		char fullpath_subproc[PATH_MAX] = {};
+		int cnt = readlink("/proc/self/exe", fullpath_subproc, PATH_MAX);
+		if (cnt < 0 || cnt >= PATH_MAX) {
+			printf("get self directory failure, err = %d\n", errno);
+			break;
+		}
+
+		for (int i = cnt; i >= 0; i--) {
+			if (fullpath_subproc[i] == '/') {
+				fullpath_subproc[i + 1] = '\0';
+				break;
+			}
+		}
+
+		strcat(fullpath_subproc, protogroup[i].supportfile);
+		int ret = access(fullpath_subproc, X_OK);
+		if (ret != -1) {
+			supproc = new(std::nothrow) char[PATH_MAX];
+			strcpy(supproc, fullpath_subproc);
+		}
+
+		break;
 	}
 
-	return filename;
+	return supproc;
 }
 
-size_t msgsend_to_mfslibc(int sockfd, const mfssrv_command_header* reqhdr,
-	const void* payloadbuf, size_t paloadsize, int error)
+size_t msganswer_to_mfslibc(int sockfd, const mfssrv_command_header* reqhdr,
+	const void* payloadbuf, size_t payloadsize, int error)
 {
 	mfssrv_command_header anshdr = *reqhdr;
 	anshdr.mode = MFSSRV_OP_ANSWER;
-	anshdr.payload = (uint32_t)paloadsize;
+	anshdr.payload = (uint32_t)payloadsize;
 	anshdr.error = error;
 	anshdr.reserved = 0;
 
@@ -227,49 +301,133 @@ size_t msgsend_to_mfslibc(int sockfd, const mfssrv_command_header* reqhdr,
 	}
 
 	ssize = 0;
-	if (payloadbuf != NULL && paloadsize != 0) {
-		ssize = _senddata_withslice(sockfd, payloadbuf, paloadsize);
+	if (payloadbuf != NULL && payloadsize != 0) {
+		ssize = _senddata_withslice(sockfd, payloadbuf, payloadsize);
 	}
 	
 	return ssize;
 }
 
+size_t msgsend_to_mfsproc(int sockfd, uint32_t command,
+	const void* payloadbuf,	size_t payloadsize, int error)
+{
+	mfsproc_command_header req_prochdr = {};
+	req_prochdr.magic = MULTIFS_HEADER_MAGIC;
+	req_prochdr.version = MULTIFS_PROTO_VERSION;
+	req_prochdr.mode = OP_REQUEST;
+	req_prochdr.command = command;
+	req_prochdr.error = error;
+	req_prochdr.sequence = prosequece++;
+	req_prochdr.payload = (uint32_t)payloadsize;
+	req_prochdr.reserved = 0;
+
+	size_t ssize = _senddata_withslice(sockfd, &req_prochdr, sizeof(req_prochdr));
+	if (ssize != sizeof(req_prochdr)) {
+		return -1;
+	}
+
+	ssize = 0;
+	if (payloadbuf != NULL && payloadsize != 0) {
+		ssize = _senddata_withslice(sockfd, payloadbuf, payloadsize);
+	}
+
+	return ssize;
+}
+
+size_t msgrecv_from_mfsproc(int sockfd, mfsproc_command_header* anshdr,
+	void* payloadbuf, size_t payloadsize, int& error)
+{
+	size_t rsize = _recvdata_withslice(sockfd, anshdr, sizeof(mfsproc_command_header));
+	if (rsize != sizeof(mfsproc_command_header)) {
+		error = EPROTO;
+		return -1;
+	}
+
+	if (anshdr->magic != MULTIFS_HEADER_MAGIC) {
+		error = EPROTO;
+		return -1;
+	}
+
+	if (anshdr->version != MULTIFS_PROTO_VERSION) {
+		error = EPROTONOSUPPORT;
+		return -1;
+	}
+
+	if (anshdr->mode != OP_ANSWER) {
+		error = EPROTO;
+		return -1;
+	}
+
+	if (anshdr->command >= MFS_COMMAND_MAX) {
+		error = EPROTO;
+		return -1;
+	}
+
+	if (anshdr->error != 0) {
+		error = anshdr->error;
+	}
+
+	rsize = 0;
+	size_t sizeread = __min(anshdr->payload, payloadsize);
+	if (payloadbuf != NULL && payloadsize != 0) {
+		rsize = _recvdata_withslice(sockfd, payloadbuf, sizeread);
+		if (rsize != sizeread) {
+			error = ENETUNREACH;
+			return -1;
+		}
+	}
+
+	// discard the redundant data
+	size_t surplus = (anshdr->payload > payloadsize) ? (anshdr->payload - payloadsize) : 0;
+	while (surplus > 0) {
+		char buff[1024];
+		size_t slice = __max(surplus, sizeof(buff));
+		size_t datasize = _recvdata_withslice(sockfd, buff, slice);
+		if (datasize != -1) {
+			surplus -= datasize;
+		}
+	}
+	
+	return rsize;
+}
+
 int dispatch_command(int sockfd, const mfssrv_command_header* libcreqhdr)
 {
 	int result = -1;
+	int err = 0;
 
 	do 
 	{
 		if (libcreqhdr->magic != MFSSRV_HEADER_MAGIC) {
-			errno = EPROTO;
+			err = EPROTO;
 			break;
 		}
 
-		if (libcreqhdr->version != MFSSRV_PROTO_VERSION) {
-			errno = EPROTONOSUPPORT;
+		if (libcreqhdr->version > MFSSRV_PROTO_VERSION) {
+			err = EPROTONOSUPPORT;
 			break;
 		}
 
 		if (libcreqhdr->mode != MFSSRV_OP_REQUEST) {
-			errno = EPROTO;
+			err = EPROTO;
 			break;
 		}
 
 		if (libcreqhdr->command >= MFSSRV_COMMAND_MAX) {
-			errno = EPROTO;
+			err = EPROTO;
 			break;
 		}
 
 		if (libcreqhdr->error != 0)	{
-			errno = EPROTO;
+			err = EPROTO;
 			break;
 		}
 
-		typedef int (*dispatch_routine)(int sockfd, const mfssrv_command_header * libcreqhdr);
+		typedef int (*dispatch_routine)(int sockfd, const mfssrv_command_header *libcreqhdr, int &error);
 		typedef struct _dispatch_table {
 			uint32_t command;
 			dispatch_routine routine;
-			size_t min_payload;
+			size_t minpayload;
 			bool asyncmode;
 		}dispatch_table;
 		static dispatch_table disptbl[] = {
@@ -291,19 +449,19 @@ int dispatch_command(int sockfd, const mfssrv_command_header* libcreqhdr)
 
 		for (size_t i = 0; i < sizeof(disptbl) / sizeof(disptbl[0]); i++) {
 			if (libcreqhdr->command == disptbl[i].command) {
-				if (libcreqhdr->payload < disptbl[i].min_payload) {
-					errno = EPROTO;
+				if (libcreqhdr->payload < disptbl[i].minpayload) {
+					err = EPROTO;
 					break;
 				}
 
-				result = disptbl[i].routine(sockfd, libcreqhdr);
+				result = disptbl[i].routine(sockfd, libcreqhdr, err);
 				break;
 			}
 		}
 	} while (false);
 
 	if (result == -1) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, libcreqhdr, NULL, 0, errno);
+		size_t ssize = msganswer_to_mfslibc(sockfd, libcreqhdr, NULL, 0, err);
 	}
 
 	close(sockfd);
@@ -311,45 +469,36 @@ int dispatch_command(int sockfd, const mfssrv_command_header* libcreqhdr)
 	return result;
 }
 
-int dispatch_command_query(int sockfd, const mfssrv_command_header* reqhdr)
+int dispatch_command_query(int sockfd, const mfssrv_command_header* reqhdr, int& error)
 {
+	error = 0;
+
 	mfssrv_command_query_in srvqueryin = {};
 	size_t rsize = _recvdata_withslice(sockfd, &srvqueryin, sizeof(srvqueryin));
 	if (rsize != sizeof(srvqueryin)) {
-		errno = EPROTO;
+		error = EPROTO;
 		return -1;
 	}
 
 	mfssrv_command_query_out srvqueryout = {};
 	srvqueryout.type = gettype_bypath(srvqueryin.filepath);
 
-	size_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, &srvqueryout, sizeof(srvqueryout), 0);
-	if (ssize != sizeof(srvqueryout)) {
-		return -1;
-	}
-
+	size_t ssize = msganswer_to_mfslibc(sockfd, reqhdr, &srvqueryout, sizeof(srvqueryout), 0);
 	return 0;
 }
 
-int dispatch_command_open(int sockfd, const mfssrv_command_header* reqhdr)
+int dispatch_command_open(int sockfd, const mfssrv_command_header* reqhdr, int& error)
 {
-	mfssrv_command_open_in srvopenin = {};
-	size_t rsize = _recvdata_withslice(sockfd, &srvopenin, sizeof(srvopenin));
-	if (rsize != sizeof(srvopenin)) {
-		errno = EPROTO;
-		return -1;
-	}
-
+	error = 0;
 	int result = -1;
-	int error = 0;
-
-	mfssrv_command_open_out srvopenout = {};
+	char* subproc = NULL;
 
 	do 
 	{
-		char* curdir = get_current_dir_name();
-		if (curdir == NULL) {
-			error = errno;
+		mfssrv_command_open_in srvopenin = {};
+		size_t rsize = _recvdata_withslice(sockfd, &srvopenin, sizeof(srvopenin));
+		if (rsize != sizeof(srvopenin)) {
+			error = EPROTO;
 			break;
 		}
 
@@ -359,8 +508,8 @@ int dispatch_command_open(int sockfd, const mfssrv_command_header* reqhdr)
 			break;
 		}
 
-		const char* name = getsupproc_bypath(srvopenin.filepath);
-		if (name == NULL) {
+		subproc = get_supprocpath_byopfilepath(srvopenin.filepath);
+		if (subproc == NULL) {
 			error = ENOTSUP;
 			break;
 		}
@@ -372,638 +521,710 @@ int dispatch_command_open(int sockfd, const mfssrv_command_header* reqhdr)
 			break;
 		}
 
-		mfsio_info* info = new(std::nothrow)mfsio_info;
-		if (info == NULL) {
+		pid_t pid = fork();
+		if (pid < 0) {
 			close(fd[0]);
 			close(fd[1]);
-
-			error = ENOMEM;
-			break;
-		}
-
-		info->size = 0;
-		info->error = 0;
-		info->offset = 0;
-		info->openmode = srvopenin.mode;
-		info->sockfd = fd[0];
-		strcpy(info->filepath, srvopenin.filepath);
-		info->pid = fork();
-		if (info->pid < 0) {
-			close(fd[0]);
-			close(fd[1]);
-			delete info;
 
 			error = errno;
 			break;
-		}
-		else if (info->pid == 0) {
+		} else if (pid == 0) {
 			close(fd[0]);
-			prctl(PR_SET_PDEATHSIG, SIGKILL);
 
-			char fullpath_subproc[PATH_MAX] = { 0 };
-			strcpy(fullpath_subproc, curdir);
-			strcat(fullpath_subproc, name);
+			prctl(PR_SET_PDEATHSIG, SIGKILL);
 
 			char paras[16] = {};
 			sprintf(paras, "%d", fd[1]);
 
-			int ret = execl(fullpath_subproc, fullpath_subproc, paras, NULL);
-			printf("sub process execl failure, err = %d\n", errno);
+			int ret = execl(subproc, subproc, paras);
+			if (ret == -1) {
+				printf("sub process execl failure, err = %d\n", errno);
+				_exit(-1);
+			}
+		} else {
 			close(fd[1]);
-			_exit(-1);
-		}
-		else {
-			close(fd[1]);
-			srvopenout.fd = -1;
 
-			do 
-			{
-				mfsproc_command_header req_prochdr = {};
-				req_prochdr.magic = MULTIFS_HEADER_MAGIC;
-				req_prochdr.version = MULTIFS_PROTO_VERSION;
-				req_prochdr.mode = OP_REQUEST;
-				req_prochdr.command = MFS_COMMAND_OPEN;
-				req_prochdr.error = 0;
-				req_prochdr.sequence = prosequece++;
-				req_prochdr.payload = sizeof(multifs_command_open_in);
-				ssize_t ssize = _senddata_withslice(info->sockfd, &req_prochdr, sizeof(req_prochdr));
-				if (ssize != sizeof(req_prochdr)) {
-					error = errno;
-					break;
-				}
+			mfsproc_command_open_in procopenin = {};
+			procopenin.mode = srvopenin.mode;
+			strcpy(procopenin.filepath, srvopenin.filepath);
 
-				multifs_command_open_in procopenin = {};
-				procopenin.mode = srvopenin.mode;
-				strcpy(procopenin.filepath, srvopenin.filepath);
-				ssize = _senddata_withslice(info->sockfd, &procopenin, sizeof(procopenin));
-				if (ssize != sizeof(procopenin)) {
-					error = errno;
-					break;
-				}
+			size_t ssize = msgsend_to_mfsproc(fd[0], MFS_COMMAND_OPEN,
+				&procopenin, sizeof(procopenin), 0);
+			if (ssize != sizeof(procopenin)) {
+				kill(pid, SIGKILL);
+				close(fd[0]);
+				error = errno;
 
-				mfsproc_command_header ans_prochdr = {};
-				rsize = _recvdata_withslice(info->sockfd, &ans_prochdr, sizeof(ans_prochdr));
-				if (rsize != sizeof(ans_prochdr)) {
-					error = errno;
-					break;
-				}
+				break;
+			}
 
-				error = ans_prochdr.error;
-				if (ans_prochdr.error != 0) {
-					break;
-				}
+			mfsproc_command_header ans_prochdr = {};
+			mfsproc_command_open_out procopenout = {};
+			rsize = msgrecv_from_mfsproc(fd[0], &ans_prochdr
+				, &procopenout, sizeof(procopenout), error);
+			if (rsize != sizeof(procopenout)) {
+				kill(pid, SIGKILL);
+				close(fd[0]);
 
-				multifs_command_open_out procopenout = {};
-				rsize = _recvdata_withslice(info->sockfd, &procopenout, sizeof(procopenout));
-				if (rsize != sizeof(procopenout)) {
-					error = errno;
-					break;
-				}
+				break;
+			}
 
-				info->size = procopenout.size;
-				srvopenout.fd = MFSSRV_REMOTEFD_MAKERFD(info->pid);
-				fdmap->insert(std::make_pair(info->pid, info));
+			error = ans_prochdr.error;
+			if (ans_prochdr.error != 0) {
+				kill(pid, SIGKILL);
+				close(fd[0]);
+				break;
+			}
 
-				result = 0;
-			} while (false);
+			mfsio_info* info = new(std::nothrow)mfsio_info;
+			if (info == NULL) {
+				kill(pid, SIGKILL);
+				close(fd[0]);
+				error = ENOMEM;
+				break;
+			}
+
+			info->pid = pid;
+			info->size = 0;
+			info->error = 0;
+			info->offset = 0;
+			info->lockstat = 0;
+			info->openmode = srvopenin.mode;
+			info->size = procopenout.size;
+			info->sockfd = fd[0];
+			strcpy(info->filepath, srvopenin.filepath);
+
+			mfssrv_command_open_out srvopenout = {};
+			srvopenout.fd = MFSSRV_REMOTEFD_MAKERFD(info->pid);
+			fdmap->insert(std::make_pair(info->pid, info));
+
+			ssize = msganswer_to_mfslibc(sockfd, reqhdr, &srvopenout, sizeof(srvopenout), 0);
+			result = 0;
 		}
 	} while (false);
 
-	if (result == -1) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, error);
-	} else {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, &srvopenout, sizeof(srvopenout), 0);
+	if (subproc != NULL) {
+		delete[] subproc;
 	}
-	
+
 	return result;
 }
 
-int dispatch_command_close(int sockfd, const mfssrv_command_header* reqhdr)
+int dispatch_command_close(int sockfd, const mfssrv_command_header* reqhdr, int& error)
 {
+	error = 0;
+
 	mfssrv_command_close_in srvclosein = {};
 	size_t rsize = _recvdata_withslice(sockfd, &srvclosein, sizeof(srvclosein));
 	if (rsize != sizeof(srvclosein)) {
-		errno = EPROTO;
+		error = EPROTO;
 		return -1;
 	}
 
 	bool validfd = check_validfd(sockfd, reqhdr, srvclosein.fd);
 	if (!validfd) {
+		error = EINVAL;
 		return -1;
 	}
 
 	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(srvclosein.fd));
 	if (it == fdmap->end()) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
+		error = EINVAL;
 		return -1;
 	}
 
 	close(it->second->sockfd);
 	kill(it->first, SIGKILL);
 
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, 0);
-	if (ssize == -1) {
-		return -1;
-	}
-
+	size_t ssize = msganswer_to_mfslibc(sockfd, reqhdr, NULL, 0, 0);
 	return 0;
 }
 
-int dispatch_command_remove(int sockfd, const mfssrv_command_header* reqhdr)
+int dispatch_command_remove(int sockfd, const mfssrv_command_header* reqhdr, int& error)
 {
-	mfssrv_command_remove_in srvremovein = {};
-	size_t rsize = _recvdata_withslice(sockfd, &srvremovein, sizeof(srvremovein));
-	if (rsize != sizeof(srvremovein)) {
-		errno = EPROTO;
-		return -1;
-	}
-
+	error = 0;
 	int result = -1;
-	int err = 0;
+	char* subproc = NULL;
 
-	do 
-	{
+	do {
+		mfssrv_command_remove_in srvremovein = {};
+		size_t rsize = _recvdata_withslice(sockfd, &srvremovein, sizeof(srvremovein));
+		if (rsize != sizeof(srvremovein)) {
+			error = EPROTO;
+			break;
+		}
+
 		size_t len = strlen(srvremovein.filepath);
 		if (len >= PATH_MAX) {
-			ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
+			error = EINVAL;
 			break;
 		}
 
-		//========= todo =========
-		int sockrecv = -1;
-		int socksend = -1;
-
-		mfsproc_command_header req_prochdr = {};
-		req_prochdr.magic = MULTIFS_HEADER_MAGIC;
-		req_prochdr.version = MULTIFS_PROTO_VERSION;
-		req_prochdr.mode = OP_REQUEST;
-		req_prochdr.command = MFS_COMMAND_REMOVE;
-		req_prochdr.error = 0;
-		req_prochdr.sequence = prosequece++;
-		req_prochdr.payload = sizeof(multifs_command_remove_in);
-		ssize_t ssize = _senddata_withslice(socksend, &req_prochdr, sizeof(req_prochdr));
-		if (ssize != sizeof(req_prochdr)) {
-			err = errno;
+		subproc = get_supprocpath_byopfilepath(srvremovein.filepath);
+		if (subproc == NULL) {
+			error = ENOTSUP;
 			break;
 		}
 
-		multifs_command_remove_in procremovein = {};
-		strcpy(procremovein.filepath, srvremovein.filepath);
-		ssize = _senddata_withslice(socksend, &procremovein, sizeof(procremovein));
-		if (ssize != sizeof(procremovein)) {
-			err = errno;
+		int fd[2] = {};
+		int ret = socketpair(AF_UNIX, SOCK_STREAM, 0, fd);
+		if (ret < 0) {
+			error = errno;
 			break;
 		}
 
-		mfsproc_command_header ans_prochdr = {};
-		rsize = _recvdata_withslice(sockrecv, &ans_prochdr, sizeof(ans_prochdr));
-		if (rsize != sizeof(ans_prochdr)) {
-			err = errno;
-			break;
-		}
+		pid_t pid = fork();
+		if (pid < 0) {
+			close(fd[0]);
+			close(fd[1]);
 
-		err = ans_prochdr.error;
-		if (ans_prochdr.error != 0) {
+			error = errno;
 			break;
-		}
+		} else if (pid == 0) {
+			close(fd[0]);
+			prctl(PR_SET_PDEATHSIG, SIGKILL);
 
-		result = 0;
+			char paras[16] = {};
+			sprintf(paras, "%d", fd[1]);
+
+			int ret = execl(subproc, subproc, paras);
+			if (ret == -1) {
+				printf("sub process execl failure, err = %d\n", errno);
+				_exit(-1);
+			}
+		} else {
+			close(fd[1]);
+
+			mfsproc_command_remove_in procremovein = {};
+			strcpy(procremovein.filepath, srvremovein.filepath);
+
+			size_t ssize = msgsend_to_mfsproc(fd[0], MFS_COMMAND_REMOVE,
+				&procremovein, sizeof(procremovein), 0);
+			if (ssize != sizeof(procremovein)) {
+				error = errno;
+				kill(pid, SIGKILL);
+				close(fd[0]);
+				break;
+			}
+
+			mfsproc_command_header ans_prochdr = {};
+			rsize = msgrecv_from_mfsproc(fd[0], &ans_prochdr, NULL, 0, error);
+			kill(pid, SIGKILL);
+			close(fd[0]);
+			if (rsize == -1) {
+				break;
+			}
+
+			error = ans_prochdr.error;
+			ssize = msganswer_to_mfslibc(sockfd, reqhdr, NULL, 0, error);
+
+			result = 0;
+		}
 	} while (false);
 
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, err);
-	if (ssize == -1) {
-		return -1;
+	if (subproc != NULL) {
+		delete[] subproc;
 	}
 
-	return 0;
+	return result;
 }
 
-int dispatch_command_read(int sockfd, const mfssrv_command_header* reqhdr)
+int dispatch_command_read(int sockfd, const mfssrv_command_header* reqhdr, int& error)
 {
+	error = 0;
+
 	mfssrv_command_read_in srvreadin = {};
 	size_t rsize = _recvdata_withslice(sockfd, &srvreadin, sizeof(srvreadin));
 	if (rsize != sizeof(srvreadin)) {
-		errno = EPROTO;
+		error = EPROTO;
 		return -1;
 	}
 
 	bool validfd = check_validfd(sockfd, reqhdr, srvreadin.fd);
 	if (!validfd) {
+		error = EINVAL;
 		return -1;
 	}
 
 	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(srvreadin.fd));
 	if (it == fdmap->end()) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
+		error = EINVAL;
 		return -1;
 	}
 
-	//========= todo =========
-	int err = 0;
+	int ret = -1;
 
-	do
-	{
-		mfsproc_command_header req_prochdr = {};
-		req_prochdr.magic = MULTIFS_HEADER_MAGIC;
-		req_prochdr.version = MULTIFS_PROTO_VERSION;
-		req_prochdr.mode = OP_REQUEST;
-		req_prochdr.command = MFS_COMMAND_READ;
-		req_prochdr.error = 0;
-		req_prochdr.sequence = prosequece++;
-		req_prochdr.payload = sizeof(multifs_command_read_in);
-		ssize_t ssize = _senddata_withslice(it->second->sockfd, &req_prochdr, sizeof(req_prochdr));
-		if (ssize != sizeof(req_prochdr)) {
-			err = errno;
+	do {
+		mfsproc_command_read_out procreadout = {};
+
+		mfssrv_command_read_out srvreadout = {};
+		mfssrv_command_header anshdr = *reqhdr;
+
+		if (srvreadin.count == 0 || srvreadin.size == 0) {
+			srvreadout.count = 0;
+			anshdr.payload = (uint32_t)sizeof(srvreadout);
+		} else {
+			mfsproc_command_read_in procreadin = {};
+			procreadin.offset = it->second->offset;
+			procreadin.size = srvreadin.count * srvreadin.size;
+
+			size_t ssize = msgsend_to_mfsproc(it->second->sockfd, MFS_COMMAND_READ,
+				&procreadin, sizeof(procreadin), 0);
+			if (ssize != sizeof(procreadin)) {
+				error = errno;
+				break;
+			}
+
+			mfsproc_command_header ans_prochdr = {};
+			
+			rsize = msgrecv_from_mfsproc(it->second->sockfd, &ans_prochdr,
+				&procreadout, sizeof(procreadout), error);
+			if (rsize != sizeof(procreadout)) {
+				break;
+			}
+
+			srvreadout.count = procreadout.size / srvreadin.size;
+			size_t retsize = srvreadout.count * srvreadin.size;
+
+			anshdr.payload = (uint32_t)sizeof(srvreadout) + (uint32_t)retsize;
+		}
+		
+		anshdr.mode = MFSSRV_OP_ANSWER;
+		anshdr.error = error;
+		anshdr.reserved = 0;
+		size_t ssize = _senddata_withslice(sockfd, &anshdr, sizeof(anshdr));
+		if (ssize != sizeof(anshdr)) {
+			error = errno;
 			break;
 		}
 
-		multifs_command_read_in procreadin = {};
-		procreadin.offset = it->second->offset;
-		procreadin.size = srvreadin.count * srvreadin.size;
-		ssize = _senddata_withslice(it->second->sockfd, &procreadin, sizeof(procreadin));
-		if (ssize != sizeof(procreadin)) {
-			err = errno;
+		ssize = _senddata_withslice(sockfd, &srvreadout, sizeof(srvreadout));
+		if (ssize != sizeof(srvreadout)) {
+			error = errno;
 			break;
 		}
 
-		mfsproc_command_header ans_prochdr = {};
-		rsize = _recvdata_withslice(it->second->sockfd, &ans_prochdr, sizeof(ans_prochdr));
-		if (rsize != sizeof(ans_prochdr)) {
-			err = errno;
-			break;
+		// read from mfsproc and write to mfslibc
+		if (srvreadin.count != 0 && srvreadin.size != 0) {
+			size_t toread = procreadout.size;
+			size_t tosend = (procreadout.size / srvreadin.size) * srvreadin.size;
+			
+			while (toread > 0) {
+				char tmpbuf[4096];
+				size_t slice = __min(sizeof(tmpbuf), toread);
+				rsize = _recvdata_withslice(it->second->sockfd, tmpbuf, slice);
+				if (rsize == -1) {
+					error = EPROTO;
+					break;
+				}
+
+				toread -= rsize;
+
+				if (tosend > 0)	{
+					slice = __min(sizeof(rsize), tosend);
+					ssize = _senddata_withslice(sockfd, tmpbuf, slice);
+					if (ssize == -1) {
+						error = EPROTO;
+						break;
+					}
+
+					tosend -= ssize;
+				}
+			}
 		}
 
-		multifs_command_read_out proreadout = {};
-		rsize = _recvdata_withslice(it->second->sockfd, &proreadout, sizeof(proreadout));
-		if (rsize != sizeof(proreadout)) {
-			err = errno;
-			break;
-		}
-
-		//read and send
-		err = 0;
+		ret = 0;
 	} while (false);
 
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, err);
-	if (ssize == -1) {
-		return -1;
-	}
-
-	return 0;
+	return ret;
 }
 
-int dispatch_command_write(int sockfd, const mfssrv_command_header* reqhdr)
+int dispatch_command_write(int sockfd, const mfssrv_command_header* reqhdr, int& error)
 {
+	error = 0;
+
 	mfssrv_command_write_in srvwritein = {};
 	size_t rsize = _recvdata_withslice(sockfd, &srvwritein, sizeof(srvwritein));
 	if (rsize != sizeof(srvwritein)) {
-		errno = EPROTO;
+		error = EPROTO;
 		return -1;
 	}
 
 	bool validfd = check_validfd(sockfd, reqhdr, srvwritein.fd);
 	if (!validfd) {
+		error = EINVAL;
 		return -1;
 	}
 
 	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(srvwritein.fd));
 	if (it == fdmap->end()) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
+		error = EINVAL;
 		return -1;
 	}
 
-	//========= todo =========
-	int err = 0;
+	int result = -1;
 
-	do
-	{
-		mfsproc_command_header req_prochdr = {};
-		req_prochdr.magic = MULTIFS_HEADER_MAGIC;
-		req_prochdr.version = MULTIFS_PROTO_VERSION;
-		req_prochdr.mode = OP_REQUEST;
-		req_prochdr.command = MFS_COMMAND_WRITE;
-		req_prochdr.error = 0;
-		req_prochdr.sequence = prosequece++;
-		req_prochdr.payload = 0;
-		ssize_t ssize = _senddata_withslice(it->second->sockfd, &req_prochdr, sizeof(req_prochdr));
-		if (ssize != sizeof(req_prochdr)) {
-			err = errno;
-			break;
+	do {
+		mfssrv_command_write_out srvwriteout = {};
+		if (srvwritein.count == 0 || srvwritein.size == 0) {
+			srvwriteout.count = 0;
+		} else {
+			mfsproc_command_write_in procwritein = {};
+			procwritein.offset = it->second->offset;
+			procwritein.size = srvwritein.count * srvwritein.size;
+
+			mfsproc_command_header req_prochdr = {};
+			req_prochdr.magic = MULTIFS_HEADER_MAGIC;
+			req_prochdr.version = MULTIFS_PROTO_VERSION;
+			req_prochdr.mode = OP_REQUEST;
+			req_prochdr.command = MFS_COMMAND_WRITE;
+			req_prochdr.error = error;
+			req_prochdr.sequence = prosequece++;
+			req_prochdr.payload = (uint32_t)sizeof(mfsproc_command_write_in) + (uint32_t)(procwritein.size);
+			req_prochdr.reserved = 0;
+			size_t ssize = _senddata_withslice(it->second->sockfd, &req_prochdr, sizeof(req_prochdr));
+			if (ssize != sizeof(req_prochdr)) {
+				break;
+			}
+
+			ssize = _senddata_withslice(it->second->sockfd, &procwritein, sizeof(procwritein));
+			if (ssize != sizeof(procwritein)) {
+				break;
+			}
+
+			size_t torecv = procwritein.size;
+			while (torecv > 0) {
+				char tmpbuf[4096];
+				size_t slice = __min(sizeof(tmpbuf), torecv);
+				rsize = _recvdata_withslice(sockfd, tmpbuf, slice);
+				if (rsize != slice) {
+					error = EPROTO;
+					break;
+				}
+
+				torecv -= rsize;
+				ssize = _senddata_withslice(it->second->sockfd, tmpbuf, rsize);
+				if (ssize != rsize) {
+					break;
+				}
+			}
+
+			mfsproc_command_write_out procwriteout = {};
+			rsize = _recvdata_withslice(it->second->sockfd, &procwriteout, sizeof(procwriteout));
+			if (rsize != sizeof(procwriteout)) {
+				error = EPROTO;
+				break;
+			}
+
+			srvwriteout.count = procwriteout.size / srvwritein.size;
 		}
 
-		mfsproc_command_header ans_prochdr = {};
-		rsize = _recvdata_withslice(it->second->sockfd, &ans_prochdr, sizeof(ans_prochdr));
-		if (rsize != sizeof(ans_prochdr)) {
-			err = errno;
-			break;
-		}
+		size_t ssize = msganswer_to_mfslibc(sockfd, reqhdr,
+			&srvwriteout, sizeof(srvwriteout), 0);
 
-		err = 0;
+		result = 0;
 	} while (false);
 
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, err);
-	if (ssize == -1) {
-		return -1;
-	}
-
-	return 0;
+	return result;
 }
 
-int dispatch_command_flush(int sockfd, const mfssrv_command_header* reqhdr)
+int dispatch_command_flush(int sockfd, const mfssrv_command_header* reqhdr, int& error)
 {
-	mfssrv_command_flush_in flushin = {};
-	size_t rsize = _recvdata_withslice(sockfd, &flushin, sizeof(flushin));
-	if (rsize != sizeof(flushin)) {
-		errno = EPROTO;
+	error = 0;
+
+	mfssrv_command_flush_in srvflushin = {};
+	size_t rsize = _recvdata_withslice(sockfd, &srvflushin, sizeof(srvflushin));
+	if (rsize != sizeof(srvflushin)) {
+		error = EPROTO;
 		return -1;
 	}
 
-	bool validfd = check_validfd(sockfd, reqhdr, flushin.fd);
+	bool validfd = check_validfd(sockfd, reqhdr, srvflushin.fd);
 	if (!validfd) {
+		error = EINVAL;
 		return -1;
 	}
 
-	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(flushin.fd));
+	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(srvflushin.fd));
 	if (it == fdmap->end()) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
+		error = EINVAL;
 		return -1;
 	}
 
-	int err = 0;
+	int result = -1;
 
-	do 
-	{
-		mfsproc_command_header req_prochdr = {};
-		req_prochdr.magic = MULTIFS_HEADER_MAGIC;
-		req_prochdr.version = MULTIFS_PROTO_VERSION;
-		req_prochdr.mode = OP_REQUEST;
-		req_prochdr.command = MFS_COMMAND_FLUSH;
-		req_prochdr.error = 0;
-		req_prochdr.sequence = prosequece++;
-		req_prochdr.payload = 0;
-		ssize_t ssize = _senddata_withslice(it->second->sockfd, &req_prochdr, sizeof(req_prochdr));
-		if (ssize != sizeof(req_prochdr)) {
-			err = errno;
+	do {
+		size_t ssize = msgsend_to_mfsproc(it->second->sockfd, MFS_COMMAND_FLUSH,
+			NULL, 0, 0);
+		if (ssize == -1) {
+			error = errno;
 			break;
 		}
 
 		mfsproc_command_header ans_prochdr = {};
-		rsize = _recvdata_withslice(it->second->sockfd, &ans_prochdr, sizeof(ans_prochdr));
-		if (rsize != sizeof(ans_prochdr)) {
-			err = errno;
+		rsize = msgrecv_from_mfsproc(it->second->sockfd, &ans_prochdr,
+			NULL, 0, error);
+		if (rsize == -1) {
 			break;
 		}
 
-		err = 0;
-	} while (false);
-	
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, err);
-	if (ssize == -1) {
-		return -1;
-	}
+		error = ans_prochdr.error;
+		if (ans_prochdr.error != 0) {
+			break;
+		}
 
-	return 0;
+		ssize = msganswer_to_mfslibc(sockfd, reqhdr,
+			NULL, 0, 0);
+
+		result = 0;
+	} while (false);
+
+	return result;
 }
 
-int dispatch_command_truncate(int sockfd, const mfssrv_command_header* reqhdr)
+int dispatch_command_truncate(int sockfd, const mfssrv_command_header* reqhdr, int& error)
 {
-	mfssrv_command_truncate_in truncatein = {};
-	size_t rsize = _recvdata_withslice(sockfd, &truncatein, sizeof(truncatein));
-	if (rsize != sizeof(truncatein)) {
-		errno = EPROTO;
+	error = 0;
+
+	mfssrv_command_truncate_in srvtruncatein = {};
+	size_t rsize = _recvdata_withslice(sockfd, &srvtruncatein, sizeof(srvtruncatein));
+	if (rsize != sizeof(srvtruncatein)) {
+		error = EPROTO;
 		return -1;
 	}
 
-	bool validfd = check_validfd(sockfd, reqhdr, truncatein.fd);
+	bool validfd = check_validfd(sockfd, reqhdr, srvtruncatein.fd);
 	if (!validfd) {
+		error = EINVAL;
 		return -1;
 	}
 
-	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(truncatein.fd));
+	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(srvtruncatein.fd));
 	if (it == fdmap->end()) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
+		error = EINVAL;
 		return -1;
 	}
 
-	int err = 0;
+	int result = -1;
 
-	do
-	{
-		mfsproc_command_header req_prochdr = {};
-		req_prochdr.magic = MULTIFS_HEADER_MAGIC;
-		req_prochdr.version = MULTIFS_PROTO_VERSION;
-		req_prochdr.mode = OP_REQUEST;
-		req_prochdr.command = MFS_COMMAND_TRUNCATE;
-		req_prochdr.error = 0;
-		req_prochdr.sequence = prosequece++;
-		req_prochdr.payload = 0;
-		ssize_t ssize = _senddata_withslice(it->second->sockfd, &req_prochdr, sizeof(req_prochdr));
-		if (ssize != sizeof(req_prochdr)) {
-			err = errno;
+	do {
+		mfsproc_command_truncate_in procstruncatein = {};
+		procstruncatein.size = srvtruncatein.size;
+		size_t ssize = msgsend_to_mfsproc(it->second->sockfd, MFS_COMMAND_TRUNCATE,
+			&procstruncatein, sizeof(procstruncatein), 0);
+		if (ssize != sizeof(procstruncatein)) {
+			error = errno;
 			break;
 		}
 
 		mfsproc_command_header ans_prochdr = {};
-		rsize = _recvdata_withslice(it->second->sockfd, &ans_prochdr, sizeof(ans_prochdr));
-		if (rsize != sizeof(ans_prochdr)) {
-			err = errno;
+		rsize = msgrecv_from_mfsproc(it->second->sockfd, &ans_prochdr,
+			NULL, 0, error);
+		if (rsize == -1) {
 			break;
 		}
 
-		err = 0;
+		error = ans_prochdr.error;
+		if (ans_prochdr.error != 0) {
+			break;
+		}
+
+		ssize = msganswer_to_mfslibc(sockfd, reqhdr,
+			NULL, 0, 0);
+
+		result = 0;
 	} while (false);
 
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, err);
-	if (ssize == -1) {
-		return -1;
-	}
-
-	return 0;
+	return result;
 }
 
-int dispatch_command_stat(int sockfd, const mfssrv_command_header* reqhdr)
+int dispatch_command_stat(int sockfd, const mfssrv_command_header* reqhdr, int& error)
 {
-	mfssrv_command_stat_in srvstatin = {};
+	error = 0;
+	int result = -1;
+	char* subproc = NULL;
+
+	do {
+		mfssrv_command_stat_in srvstatin = {};
+		size_t rsize = _recvdata_withslice(sockfd, &srvstatin, sizeof(srvstatin));
+		if (rsize != sizeof(srvstatin)) {
+			error = EPROTO;
+			return -1;
+		}
+
+		size_t len = strlen(srvstatin.filepath);
+		if (len >= PATH_MAX) {
+			error = EINVAL;
+			return -1;
+		}
+
+		subproc = get_supprocpath_byopfilepath(srvstatin.filepath);
+		if (subproc == NULL) {
+			error = ENOTSUP;
+			break;
+		}
+
+		int fd[2] = {};
+		int ret = socketpair(AF_UNIX, SOCK_STREAM, 0, fd);
+		if (ret < 0) {
+			error = errno;
+			break;
+		}
+
+		pid_t pid = fork();
+		if (pid < 0) {
+			close(fd[0]);
+			close(fd[1]);
+
+			error = errno;
+			break;
+		} else if (pid == 0) {
+			close(fd[0]);
+			prctl(PR_SET_PDEATHSIG, SIGKILL);
+
+			char paras[16] = {};
+			sprintf(paras, "%d", fd[1]);
+
+			ret = execl(subproc, subproc, paras);
+			if (ret == -1) {
+				printf("sub process execl failure, err = %d\n", errno);
+				_exit(-1);
+			}
+		} else {
+			close(fd[1]);
+
+			mfsproc_command_stat_in procstatin = {};
+			strcpy(procstatin.filepath, srvstatin.filepath);
+
+			size_t ssize = msgsend_to_mfsproc(fd[0], MFS_COMMAND_STAT,
+				&procstatin, sizeof(procstatin), 0);
+			if (ssize != sizeof(procstatin)) {
+				error = errno;
+				kill(pid, SIGKILL);
+				close(fd[0]);
+				break;
+			}
+
+			mfsproc_command_header ans_prochdr = {};
+			mfsproc_command_stat_out procstatout = {};
+			rsize = msgrecv_from_mfsproc(fd[0], &ans_prochdr,
+				&procstatout, sizeof(procstatout), error);
+			kill(pid, SIGKILL);
+			close(fd[0]);
+			if (rsize != sizeof(procstatout)) {
+				break;
+			}
+
+			error = ans_prochdr.error;
+
+			mfssrv_command_stat_out srvstatout = {};
+			memcpy(&srvstatout.stbuf, &procstatout.stbuf, sizeof(struct stat));
+			ssize = msganswer_to_mfslibc(sockfd, reqhdr,
+				&srvstatout, sizeof(srvstatout), 0);
+
+			result = 0;
+		}
+	} while (false);
+
+	if (subproc != NULL) {
+		delete[] subproc;
+	}
+
+	return result;
+}
+
+int dispatch_command_statfd(int sockfd, const mfssrv_command_header* reqhdr, int& error)
+{
+	error = 0;
+
+	mfssrv_command_statfd_in srvstatin = {};
 	size_t rsize = _recvdata_withslice(sockfd, &srvstatin, sizeof(srvstatin));
 	if (rsize != sizeof(srvstatin)) {
-		errno = EPROTO;
+		error = EPROTO;
 		return -1;
 	}
 
-	size_t len = strlen(srvstatin.filepath);
-	if (len >= PATH_MAX) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
-		return -1;
-	}
-
-	int err = 0;
-	multifs_command_stat_out procstatout = {};
-
-	do
-	{
-		//========= todo =========
-		int sockrecv = -1;
-		int socksend = -1;
-
-		mfsproc_command_header req_prochdr = {};
-		req_prochdr.magic = MULTIFS_HEADER_MAGIC;
-		req_prochdr.version = MULTIFS_PROTO_VERSION;
-		req_prochdr.mode = OP_REQUEST;
-		req_prochdr.command = MFS_COMMAND_STAT;
-		req_prochdr.error = 0;
-		req_prochdr.sequence = prosequece++;
-		req_prochdr.payload = sizeof(multifs_command_stat_in);
-		ssize_t ssize = _senddata_withslice(socksend, &req_prochdr, sizeof(req_prochdr));
-		if (ssize != sizeof(req_prochdr)) {
-			err = errno;
-			break;
-		}
-
-		multifs_command_stat_in procstatin = {};
-		strcpy(procstatin.filepath, srvstatin.filepath);
-		ssize = _senddata_withslice(socksend, &procstatin, sizeof(procstatin));
-		if (ssize != sizeof(procstatin)) {
-			err = errno;
-			break;
-		}
-
-		mfsproc_command_header ans_prochdr = {};
-		rsize = _recvdata_withslice(sockrecv, &ans_prochdr, sizeof(ans_prochdr));
-		if (rsize != sizeof(ans_prochdr)) {
-			err = errno;
-			break;
-		}
-
-		rsize = _recvdata_withslice(sockrecv, &procstatout, sizeof(procstatout));
-		if (rsize != sizeof(procstatout)) {
-			err = errno;
-			break;
-		}
-
-		err = 0;
-	} while (false);
-
-	ssize_t ssize = 0;
-	if (err == 0) {
-		ssize = msgsend_to_mfslibc(sockfd, reqhdr, &procstatout, sizeof(procstatout), 0);
-	} else {
-		ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, err);
-	}
-	if (ssize == -1) {
-		return -1;
-	}
-
-	return 0;
-}
-
-int dispatch_command_statfd(int sockfd, const mfssrv_command_header* reqhdr)
-{
-	mfssrv_command_statfd_in statin = {};
-	size_t rsize = _recvdata_withslice(sockfd, &statin, sizeof(statin));
-	if (rsize != sizeof(statin)) {
-		errno = EPROTO;
-		return -1;
-	}
-
-	bool validfd = check_validfd(sockfd, reqhdr, statin.fd);
+	bool validfd = check_validfd(sockfd, reqhdr, srvstatin.fd);
 	if (!validfd) {
+		error = EINVAL;
 		return -1;
 	}
 
-	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(statin.fd));
+	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(srvstatin.fd));
 	if (it == fdmap->end()) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
+		error = EINVAL;
 		return -1;
 	}
 
-	int err = 0;
-	multifs_command_stat_out procstatout = {};
+	int result = -1;
 
-	do
-	{
-		mfsproc_command_header req_prochdr = {};
-		req_prochdr.magic = MULTIFS_HEADER_MAGIC;
-		req_prochdr.version = MULTIFS_PROTO_VERSION;
-		req_prochdr.mode = OP_REQUEST;
-		req_prochdr.command = MFS_COMMAND_STAT;
-		req_prochdr.error = 0;
-		req_prochdr.sequence = prosequece++;
-		req_prochdr.payload = sizeof(multifs_command_stat_in);
-		ssize_t ssize = _senddata_withslice(it->second->sockfd, &req_prochdr, sizeof(req_prochdr));
-		if (ssize != sizeof(req_prochdr)) {
-			err = errno;
-			break;
-		}
-
-		multifs_command_stat_in procstatin = {};
+	do {
+		mfsproc_command_stat_in procstatin = {};
 		strcpy(procstatin.filepath, it->second->filepath);
-		ssize = _senddata_withslice(it->second->sockfd, &procstatin, sizeof(procstatin));
+		size_t ssize = msgsend_to_mfsproc(it->second->sockfd, MFS_COMMAND_STAT,
+			&procstatin, sizeof(procstatin), 0);
 		if (ssize != sizeof(procstatin)) {
-			err = errno;
+			error = errno;
 			break;
 		}
 
 		mfsproc_command_header ans_prochdr = {};
-		rsize = _recvdata_withslice(it->second->sockfd, &ans_prochdr, sizeof(ans_prochdr));
-		if (rsize != sizeof(ans_prochdr)) {
-			err = errno;
-			break;
-		}
-		
-		rsize = _recvdata_withslice(it->second->sockfd, &procstatout, sizeof(procstatout));
+		mfsproc_command_stat_out procstatout = {};
+		rsize = msgrecv_from_mfsproc(it->second->sockfd, &ans_prochdr,
+			&procstatout, sizeof(procstatout), error);
 		if (rsize != sizeof(procstatout)) {
-			err = errno;
 			break;
 		}
 
-		err = 0;
+		error = ans_prochdr.error;
+		if (ans_prochdr.error != 0) {
+			break;
+		}
+
+		mfssrv_command_stat_out srvstatout = {};
+		memcpy(&srvstatout.stbuf, &procstatout.stbuf, sizeof(struct stat));
+		ssize = msganswer_to_mfslibc(sockfd, reqhdr,
+			&srvstatout, sizeof(srvstatout), 0);
+
+		result = 0;
 	} while (false);
 
-	ssize_t ssize = 0;
-	if (err == 0)
-	{
-		ssize = msgsend_to_mfslibc(sockfd, reqhdr, &procstatout, sizeof(procstatout), 0);
-	} else {
-		ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, err);
-	}
-	if (ssize == -1) {
-		return -1;
-	}
-
-	return 0;
+	return result;
 }
 
-int dispatch_command_lock(int sockfd, const mfssrv_command_header* reqhdr)
+int dispatch_command_lock(int sockfd, const mfssrv_command_header* reqhdr, int& error)
 {
+	error = 0;
+
 	mfssrv_command_lock_in srvlockin = {};
 	size_t rsize = _recvdata_withslice(sockfd, &srvlockin, sizeof(srvlockin));
 	if (rsize != sizeof(srvlockin)) {
-		errno = EPROTO;
+		error = EPROTO;
 		return -1;
 	}
 
 	bool validfd = check_validfd(sockfd, reqhdr, srvlockin.fd);
 	if (!validfd) {
+		error = EINVAL;
 		return -1;
 	}
 
 	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(srvlockin.fd));
 	if (it == fdmap->end()) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
+		error = EINVAL;
 		return -1;
 	}
 
-	//========= todo =========
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, 0);
-	if (ssize == -1) {
-		return -1;
-	}
+	// now, not support this operation, need add support later
+	size_t ssize = msganswer_to_mfslibc(sockfd, reqhdr, NULL, 0, 0);
 
 	return 0;
 }
 
-int dispatch_command_seek(int sockfd, const mfssrv_command_header* reqhdr)
+int dispatch_command_seek(int sockfd, const mfssrv_command_header* reqhdr, int& error)
 {
+	error = 0;
+
 	mfssrv_command_seek_in srvseekin = {};
 	size_t rsize = _recvdata_withslice(sockfd, &srvseekin, sizeof(srvseekin));
 	if (rsize != sizeof(srvseekin)) {
@@ -1013,12 +1234,13 @@ int dispatch_command_seek(int sockfd, const mfssrv_command_header* reqhdr)
 
 	bool validfd = check_validfd(sockfd, reqhdr, srvseekin.fd);
 	if (!validfd) {
+		error = EINVAL;
 		return -1;
 	}
 
 	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(srvseekin.fd));
 	if (it == fdmap->end()) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
+		error = EINVAL;
 		return -1;
 	}
 
@@ -1030,48 +1252,43 @@ int dispatch_command_seek(int sockfd, const mfssrv_command_header* reqhdr)
 	} else if (srvseekin.whence == SEEK_END) {
 		newoff = it->second->size + srvseekin.off;
 	}
-	if (newoff > it->second->size) {
-		newoff = it->second->size;
-	}
 	if (newoff < 0) {
-		newoff = 0;
-	}
-	it->second->offset = newoff;
-	
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, 0);
-	if (ssize == -1) {
+		error = EINVAL;
 		return -1;
 	}
+
+	it->second->offset = newoff;
+	size_t ssize = msganswer_to_mfslibc(sockfd, reqhdr, NULL, 0, 0);
 
 	return 0;
 }
 
-int dispatch_command_tell(int sockfd, const mfssrv_command_header* reqhdr)
+int dispatch_command_tell(int sockfd, const mfssrv_command_header* reqhdr, int& error)
 {
+	error = 0;
+
 	mfssrv_command_tell_in srvtellin = {};
 	size_t rsize = _recvdata_withslice(sockfd, &srvtellin, sizeof(srvtellin));
 	if (rsize != sizeof(srvtellin)) {
-		errno = EPROTO;
+		error = EPROTO;
 		return -1;
 	}
 
 	bool validfd = check_validfd(sockfd, reqhdr, srvtellin.fd);
 	if (!validfd) {
+		error = EINVAL;
 		return -1;
 	}
 
 	auto it = fdmap->find(MFSSRV_REMOTEFD_GETVALUE(srvtellin.fd));
 	if (it == fdmap->end()) {
-		ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, NULL, 0, EINVAL);
+		error = EINVAL;
 		return -1;
 	}
 
 	mfssrv_command_tell_out srvtellout = {};
 	srvtellout.offset = it->second->offset;
-	ssize_t ssize = msgsend_to_mfslibc(sockfd, reqhdr, &srvtellout, sizeof(srvtellout), 0);
-	if (ssize == -1) {
-		return -1;
-	}
+	size_t ssize = msganswer_to_mfslibc(sockfd, reqhdr, &srvtellout, sizeof(srvtellout), 0);
 
 	return 0;
 }

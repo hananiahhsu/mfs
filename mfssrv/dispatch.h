@@ -1,4 +1,4 @@
-﻿// Copyright 2019 MesaTEE Authors
+// Copyright 2019 MesaTEE Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,35 +32,39 @@ extern bool exitproc;
 
 int dispatch_command(int sockfd, const mfssrv_command_header* libcreqhdr);
 
-int dispatch_command_query(int sockfd, const mfssrv_command_header *reqhdr);
-int dispatch_command_open(int sockfd, const mfssrv_command_header *reqhdr);
-int dispatch_command_close(int sockfd, const mfssrv_command_header *reqhdr);
-int dispatch_command_remove(int sockfd, const mfssrv_command_header *reqhdr);
-int dispatch_command_read(int sockfd, const mfssrv_command_header *reqhdr);
-int dispatch_command_write(int sockfd, const mfssrv_command_header *reqhdr);
-int dispatch_command_flush(int sockfd, const mfssrv_command_header *reqhdr);
-int dispatch_command_truncate(int sockfd, const mfssrv_command_header *reqhdr);
-int dispatch_command_stat(int sockfd, const mfssrv_command_header *reqhdr);
-int dispatch_command_statfd(int sockfd, const mfssrv_command_header *reqhdr);
-int dispatch_command_lock(int sockfd, const mfssrv_command_header *reqhdr);
-int dispatch_command_seek(int sockfd, const mfssrv_command_header *reqhdr);
-int dispatch_command_tell(int sockfd, const mfssrv_command_header *reqhdr);
+int dispatch_command_query(int sockfd, const mfssrv_command_header *reqhdr, int& error);
+int dispatch_command_open(int sockfd, const mfssrv_command_header *reqhdr, int& error);
+int dispatch_command_close(int sockfd, const mfssrv_command_header *reqhdr, int& error);
+int dispatch_command_remove(int sockfd, const mfssrv_command_header *reqhdr, int& error);
+int dispatch_command_read(int sockfd, const mfssrv_command_header *reqhdr, int& error);
+int dispatch_command_write(int sockfd, const mfssrv_command_header *reqhdr, int& error);
+int dispatch_command_flush(int sockfd, const mfssrv_command_header *reqhdr, int& error);
+int dispatch_command_truncate(int sockfd, const mfssrv_command_header *reqhdr, int& error);
+int dispatch_command_stat(int sockfd, const mfssrv_command_header *reqhdr, int& error);
+int dispatch_command_statfd(int sockfd, const mfssrv_command_header *reqhdr, int& error);
+int dispatch_command_lock(int sockfd, const mfssrv_command_header *reqhdr, int& error);
+int dispatch_command_seek(int sockfd, const mfssrv_command_header *reqhdr, int& error);
+int dispatch_command_tell(int sockfd, const mfssrv_command_header *reqhdr, int& error);
 
 int do_init();
 void do_uninit();
 
 bool check_validfd(int sock, const mfssrv_command_header* reqhdr, int fd);
-mfssup_type_e gettype_bypath(const char* filepath);
-const char* getsupproc_bypath(const char* filepath);
+mfssup_type_e gettype_bypath(const char* opfilepath);
+char* get_supprocpath_byopfilepath(const char* opfilepath);
 
 void signal_handler(int sig);
 
-size_t msgsend_to_mfslibc(int sockfd, const mfssrv_command_header* reqhdr,
-	const void* payloadbuf, size_t paloadsize, int error);
+// return the payload size
+size_t msganswer_to_mfslibc(int sockfd, const mfssrv_command_header* reqhdr,
+	const void* payloadbuf, size_t payloadsize, int error);
 
-size_t msgsend_to_mfsproc(int sockfd, const mfsproc_command_header* reqhdr,
-	const void* payloadbuf, size_t paloadsize, int error);
-size_t msgrecv_from_mfsproc(int sockfd, const mfsproc_command_header* reqhdr,
-	const void* payloadbuf, size_t paloadsize, int error);
+// return the payload size
+size_t msgsend_to_mfsproc(int sockfd, uint32_t command,
+	const void* payloadbuf,	size_t payloadsize, int error);
+
+// return the payload size
+size_t msgrecv_from_mfsproc(int sockfd, mfsproc_command_header* anshdr,
+	void* payloadbuf, size_t payloadsize, int &error);
 
 #endif // _DISPATCH_H_

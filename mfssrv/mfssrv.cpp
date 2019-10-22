@@ -36,7 +36,7 @@ int main(int argc, char* argv[])
 {
 	int listenfd = do_init();
 	if (listenfd < 0) {
-		ERR_EXIT("mfs init error");
+		ERR_EXIT("mfs init error\n");
 	}
 
 	signal(SIGTERM, &signal_handler);
@@ -51,7 +51,7 @@ int main(int argc, char* argv[])
 				continue;
 			}
 
-			ERR_EXIT("mfssrv accept error");
+			ERR_EXIT("mfssrv accept error\n");
 		}
 
 		mfssrv_command_header srvhdr = {};

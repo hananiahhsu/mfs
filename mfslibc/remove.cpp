@@ -31,10 +31,15 @@ int MFSAPI mfs_remove(const char* filename)
 	}
 
 	int sup = _mfslibc_querysupport(filename);
-	if (sup != MFSSUP_TYPE_SMFS) {
+	if (sup == MFSSUP_TYPE_NOTMFSTYPE) {
 		// for local mode
 		int ret = remove(filename);
 		return ret;
+	}
+
+	if (sup != MFSSUP_TYPE_SUPMFSTYPE) {
+		errno = EOPNOTSUPP;
+		return -1;
 	}
 
 	mfssrv_command_remove_in removein = {};

@@ -24,7 +24,7 @@ MULTIFS_BIN_DIR := $(MULTIFS_PROJECT_ROOT)/bin
 PROJECT_ROOT := $(MULTIFS_PROJECT_ROOT)
 OUT_DIR := $(MULTIFS_OUT_DIR)
 
-INCLUDE += -I$(PROJECT_ROOT) -I$(PROJECT_ROOT)/inc
+INCLUDE += -I$(PROJECT_ROOT) -I$(PROJECT_ROOT)/common -I$(PROJECT_ROOT)/inc
 CXXFLAGS += -Werror -U__STRICT_ANSI__ -std=c++11 -lpthread -fPIC -g
 CXXFLAGS += -Wno-unused-local-typedefs -Wno-shadow -Wno-missing-field-initializers -Wno-unused-parameter
 
@@ -47,7 +47,7 @@ MFSSRV_DIR := mfssrv
 MFSSRV_SRC := $(wildcard $(PROJECT_ROOT)/$(MFSSRV_DIR)/*.cpp)
 SORTED_MFSSRV_SRC := $(sort $(MFSSRV_SRC))
 SORTED_MFSSRV_OBJ := $(SORTED_MFSSRV_SRC:.cpp=.o)
-MFSSRV := $(MULTIFS_PROJECT_ROOT)/bin/mfssrv
+MFSSRV := $(MULTIFS_BIN_DIR)/mfssrv
 MFSSRV_DEPOPT := -lpthread
 
 MFSDEMO_DIR := mfsdemo

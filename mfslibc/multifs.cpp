@@ -20,7 +20,6 @@
 #include <errno.h>
 #include <sys/un.h>
 #include <sys/socket.h>
-
 #include <atomic>
 
 
@@ -32,17 +31,21 @@ int _mfslibc_querysupport(const char* filename)
 		return MFSSUP_TYPE_EINVAL;
 	}
 
-	mfssrv_command_query_in queryin = {};
+	// for local mode without "://"
+	const char *sub = strstr(filename, "://");
+	if (sub == NULL) {
+		return MFSSUP_TYPE_NOTMFSTYPE;
+	}
 
-	mfssrv_command_query_out queryout = {};
-	queryout.type = MFSSUP_TYPE_EINVAL;
+	mfssrv_command_query_in queryin = {};
+	strcpy(queryin.filepath, filename);
 
 	size_t rtrecv = 0;
-
+	mfssrv_command_query_out queryout = {};
 	int ret = _mfslibc_ipccommand(MFSSRV_COMMAND_QUERY,
 		&queryin, sizeof(queryin), &queryout, sizeof(queryout), &rtrecv);
-	if (ret == -1 || rtrecv != sizeof(queryout)) {
-		return -1;
+	if (rtrecv != sizeof(queryout)) {
+		return MFSSUP_TYPE_ESERVICE;
 	}
 
 	return queryout.type;
@@ -54,8 +57,7 @@ int _mfslibc_ipccommand(uint32_t cmd, const void* sendbuf,
 	int ret = -1;
 	int sock = -1;
 
-	do 
-	{
+	do {
 		sock = _mfslibc_connsrv();
 		if (sock == -1) {
 			break;
@@ -78,8 +80,7 @@ int _mfslibc_ipccommand(uint32_t cmd, const void* sendbuf,
 		ret = 0;
 	} while (false);
 
-	if (sock != -1)
-	{
+	if (sock != -1)	{
 		_mfslibc_closeconn(sock);
 	}
 	
@@ -204,8 +205,7 @@ int _mfslibc_getopmode(const char * mode)
 	int omode = 0;
 	int oflags = 0;
 
-	switch (*mode)
-	{
+	switch (*mode) {
 	case 'r':
 		omode = O_RDONLY;
 		break;

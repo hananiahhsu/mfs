@@ -31,7 +31,7 @@ off_t MFSAPI mfs_ftello(MFS_FILE* stream)
 
 	int ret = _mfslibc_ipccommand(MFSSRV_COMMAND_TELL,
 		&tellin, sizeof(tellin), &tellout, sizeof(tellout), &rtrecv);
-	if (ret == -1 || rtrecv != sizeof(tellout)) {
+	if (rtrecv != sizeof(tellout)) {
 		return -1;
 	}
 

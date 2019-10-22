@@ -22,7 +22,7 @@ size_t MFSAPI mfs_fwrite(const void* ptr, size_t size, size_t count, MFS_FILE* s
 {
 	CHECK_MFS_FILE(stream, 0);
 
-	if (ptr == NULL || size == 0 || count == 0) {
+	if (ptr == NULL) {
 		errno = EINVAL;
 		return -1;
 	}
@@ -37,6 +37,10 @@ size_t MFSAPI mfs_fwrite(const void* ptr, size_t size, size_t count, MFS_FILE* s
 
 	do
 	{
+		if (size == 0 || count == 0) {
+			break;
+		}
+
 		sock = _mfslibc_connsrv();
 		if (sock == -1) {
 			break;
@@ -69,8 +73,7 @@ size_t MFSAPI mfs_fwrite(const void* ptr, size_t size, size_t count, MFS_FILE* s
 		ret = writeout.count;
 	} while (false);
 
-	if (sock != -1)
-	{
+	if (sock != -1)	{
 		_mfslibc_closeconn(sock);
 	}
 
